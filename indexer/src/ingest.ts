@@ -14,8 +14,15 @@ import type { IndexerConfig } from './config.js';
 import {
   TX_READ_CONFIG,
   type RetryHooks,
+  isRateLimitError,
   withRpcRetry,
 } from './rpc.js';
+
+const SIGNATURE_SPACING_MS = 200;
+
+async function defaultSleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
 import {
   decodeAgent,
   decodeAtomStats,
@@ -100,6 +107,7 @@ export class Ingestor {
     revocations: 0,
   };
   private timer?: NodeJS.Timeout;
+  private pollInFlight = false;
   private readonly connection: Connection;
   private readonly retry: RetryHooks;
 
@@ -140,6 +148,8 @@ export class Ingestor {
   startPolling(): void {
     if (this.timer) return;
     const tick = async () => {
+      if (this.pollInFlight) return;
+      this.pollInFlight = true;
       try {
         await this.pollSignatures();
         await this.refreshCounts();
@@ -147,6 +157,8 @@ export class Ingestor {
         this.status.lastError = undefined;
       } catch (error) {
         this.status.lastError = error instanceof Error ? error.message : String(error);
+      } finally {
+        this.pollInFlight = false;
       }
     };
     void tick();
@@ -327,10 +339,21 @@ export class Ingestor {
     sigs.reverse();
     const cap = Math.max(1, this.config.maxSignaturesPerPoll);
     const batch = sigs.slice(0, cap);
-    for (const info of batch) {
-      await this.ingestSignature(info);
+    const sleep = this.retry.sleep ?? defaultSleep;
+    for (let i = 0; i < batch.length; i++) {
+      const info = batch[i];
+      try {
+        await this.ingestSignature(info);
+      } catch (error) {
+        // Pause this tick; the cursor stays at the last success and the next
+        // poll resumes. Avoid failing the whole tick (and overlapping retries)
+        // when the public RPC is rate-limiting.
+        if (isRateLimitError(error)) return;
+        throw error;
+      }
       await this.store.setCursor('registry:last_signature', info.signature);
       this.status.signaturesProcessed += 1;
+      if (i < batch.length - 1) await sleep(SIGNATURE_SPACING_MS);
     }
   }
 

@@ -177,8 +177,48 @@ describe('Ingestor signature polling', () => {
     for (const call of txCalls) {
       assert.deepEqual(call.config, TX_READ_CONFIG);
     }
-    assert.deepEqual(delays, [500]);
+    assert.deepEqual(delays, [500, 200]);
     assert.equal(await store.getCursor('registry:last_signature'), 'sig-b');
     assert.equal(ingestor.status.signaturesProcessed, 2);
+  });
+
+  it('pauses a tick on an exhausted 429 without failing later signatures', async () => {
+    const txCalls: string[] = [];
+    const connection = {
+      getSignaturesForAddress: async () => [
+        { signature: 'sig-c', slot: 30, err: null, memo: null, blockTime: null },
+        { signature: 'sig-b', slot: 20, err: null, memo: null, blockTime: null },
+        { signature: 'sig-a', slot: 10, err: null, memo: null, blockTime: null },
+      ],
+      getTransaction: async (signature: string) => {
+        txCalls.push(signature);
+        if (signature === 'sig-b') {
+          throw Object.assign(new Error('429 Too Many Requests: rate limited'), { code: 429 });
+        }
+        return {
+          slot: 10,
+          transaction: { message: { accountKeys: [] } },
+          meta: null,
+        };
+      },
+      getMultipleAccountsInfo: async () => [],
+    } as unknown as Connection;
+
+    const store = memoryStore();
+    const config = loadConfig({
+      rpcUrl: 'http://127.0.0.1:8899',
+      registryProgramId: new PublicKey('8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C'),
+      maxSignaturesPerPoll: 10,
+      pollIntervalMs: 60_000,
+    });
+    const ingestor = new Ingestor(store, config, connection, {
+      retries: 2,
+      random: () => 0.5,
+      sleep: async () => {},
+    });
+    await ingestor.pollSignatures();
+    assert.deepEqual(txCalls, ['sig-a', 'sig-b', 'sig-b']);
+    assert.equal(await store.getCursor('registry:last_signature'), 'sig-a');
+    assert.equal(ingestor.status.signaturesProcessed, 1);
   });
 });
