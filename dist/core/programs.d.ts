@@ -1,0 +1,149 @@
+/**
+ * Solana program IDs for the deployed 8004 (AgentRegistry8004 + ATOM) programs.
+ *
+ * These IDs are kept identical to the upstream 8004-solana SDK so svm-8004
+ * stays protocol-compatible with existing deployments. Musebook does not
+ * currently ship a replacement 8004 on-chain program.
+ *
+ * Cluster default for resolution helpers is devnet. The PROGRAM_ID /
+ * ATOM_ENGINE_PROGRAM_ID aliases remain the mainnet IDs for explicit
+ * mainnet address reference.
+ */
+import { PublicKey } from '@solana/web3.js';
+import type { Cluster } from './client.js';
+/**
+ * Consolidated AgentRegistry8004 Program IDs
+ * Single program containing Identity, Reputation, and Validation modules
+ */
+export declare const DEVNET_AGENT_REGISTRY_PROGRAM_ID: PublicKey;
+export declare const MAINNET_AGENT_REGISTRY_PROGRAM_ID: PublicKey;
+/**
+ * Backward-compatible alias for the mainnet Agent Registry ID.
+ * This is an explicit mainnet address, not the SDK's implicit default cluster.
+ */
+export declare const PROGRAM_ID: PublicKey;
+/** Registry program used when no cluster is specified (devnet-first). */
+export declare const DEFAULT_AGENT_REGISTRY_PROGRAM_ID: PublicKey;
+/**
+ * Metaplex Core Program ID
+ * Used for NFT asset creation and management
+ */
+export declare const MPL_CORE_PROGRAM_ID: PublicKey;
+/**
+ * ATOM Engine Program IDs
+ * Agent Trust On-chain Model - reputation computation engine
+ * v0.4.0 - Cross-program invocation for feedback/revoke operations
+ */
+export declare const DEVNET_ATOM_ENGINE_PROGRAM_ID: PublicKey;
+export declare const MAINNET_ATOM_ENGINE_PROGRAM_ID: PublicKey;
+/**
+ * Backward-compatible alias for the mainnet ATOM Engine ID.
+ * This is an explicit mainnet address, not the SDK's implicit default cluster.
+ */
+export declare const ATOM_ENGINE_PROGRAM_ID: PublicKey;
+/** ATOM program used when no cluster is specified (devnet-first). */
+export declare const DEFAULT_ATOM_ENGINE_PROGRAM_ID: PublicKey;
+export type ProgramIdInput = PublicKey | string;
+export interface ProgramIdOverrides {
+    identityRegistry?: ProgramIdInput;
+    reputationRegistry?: ProgramIdInput;
+    validationRegistry?: ProgramIdInput;
+    agentRegistry?: ProgramIdInput;
+    atomEngine?: ProgramIdInput;
+    mplCore?: ProgramIdInput;
+}
+export interface ProgramIdSet {
+    identityRegistry: PublicKey;
+    reputationRegistry: PublicKey;
+    validationRegistry: PublicKey;
+    agentRegistry: PublicKey;
+    atomEngine: PublicKey;
+    mplCore: PublicKey;
+}
+/**
+ * Resolve program IDs.
+ * Supported forms:
+ * - getProgramIds() -> devnet defaults
+ * - getProgramIds(overrides) -> devnet defaults with overrides
+ * - getProgramIds(cluster) -> cluster defaults
+ * - getProgramIds(cluster, overrides) -> cluster defaults with overrides
+ */
+export declare function getProgramIds(overrides?: ProgramIdOverrides): ProgramIdSet;
+export declare function getProgramIds(cluster: Cluster, overrides?: ProgramIdOverrides): ProgramIdSet;
+/**
+ * Resolve program IDs for a specific cluster.
+ * - devnet/testnet/localnet default to devnet IDs (overrideable)
+ * - mainnet-beta defaults to mainnet IDs (overrideable)
+ */
+export declare function getProgramIdsForCluster(cluster: Cluster, overrides?: ProgramIdOverrides): ProgramIdSet;
+/**
+ * @deprecated Use PROGRAM_ID instead - kept for backwards compatibility
+ * Program IDs resolved to devnet defaults (legacy 3-program naming)
+ */
+export declare const PROGRAM_IDS: ProgramIdSet;
+/**
+ * Get program ID
+ */
+export declare function getProgramId(): PublicKey;
+/**
+ * @deprecated Use getProgramId() instead
+ */
+/**
+ * Account discriminators (first 8 bytes of account data)
+ * Used for account type identification
+ */
+export declare const DISCRIMINATORS: {
+    readonly agentAccount: Buffer<ArrayBuffer>;
+    readonly metadataEntry: Buffer<ArrayBuffer>;
+    readonly registryConfig: Buffer<ArrayBuffer>;
+    readonly feedbackAccount: Buffer<ArrayBuffer>;
+    readonly agentReputation: Buffer<ArrayBuffer>;
+    readonly clientIndex: Buffer<ArrayBuffer>;
+    readonly responseAccount: Buffer<ArrayBuffer>;
+    readonly responseIndex: Buffer<ArrayBuffer>;
+    readonly validationRequest: Buffer<ArrayBuffer>;
+};
+/**
+ * Account sizes (in bytes) for rent calculation
+ */
+export declare const ACCOUNT_SIZES: {
+    readonly agentAccount: 297;
+    readonly metadataEntry: 307;
+    readonly feedbackAccount: 526;
+    readonly agentReputation: 64;
+    readonly clientIndex: 64;
+    readonly responseAccount: 322;
+    readonly responseIndex: 32;
+    readonly validationRequest: 147;
+};
+/**
+ * Calculate rent-exempt minimum for an account (approximation).
+ * Uses the standard Solana formula: (accountSize + 128) * 3480 * 2
+ * For exact values, use connection.getMinimumBalanceForRentExemption().
+ */
+export declare function calculateRentExempt(accountSize: number): number;
+/**
+ * PDA seeds for deterministic address derivation
+ * v0.2.0 - Consolidated program seeds
+ */
+export declare const PDA_SEEDS: {
+    readonly config: "config";
+    readonly agent: "agent";
+    readonly metadataExt: "metadata_ext";
+    readonly feedback: "feedback";
+    readonly agentReputation: "agent_reputation";
+    readonly response: "response";
+    readonly responseIndex: "response_index";
+    readonly validationConfig: "validation_config";
+    readonly validation: "validation";
+};
+/**
+ * Default configuration values
+ */
+export declare const DEFAULT_CONFIG: {
+    readonly commitment: "confirmed";
+    readonly maxRetries: 3;
+    readonly timeout: 30000;
+    readonly confirmTimeout: 60000;
+};
+//# sourceMappingURL=programs.d.ts.map

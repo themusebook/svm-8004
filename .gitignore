@@ -1,0 +1,85 @@
+# Dependencies
+node_modules/
+
+# Build outputs (dist tracked for GitHub dependency usage)
+*.tsbuildinfo
+
+# Generated files
+src/models/generated/
+
+# Environment files
+.env
+.env.*
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+coverage/
+.nyc_output/
+test-ledger/
+
+# Temporary files
+*.tmp
+*.temp
+.tmp-skill-validate/
+
+# Package manager locks (uncomment if you want to ignore)
+# package-lock.json
+# yarn.lock
+# .pnp.*
+
+# Tool caches
+.cache/
+
+package-lock.json
+yarn.lock
+.pnp.*
+
+# Compiled JS (keep TS sources)
+examples/*.js
+tests/**/*.js
+scripts/*.js
+
+# Test wallets (contains private keys)
+.test-wallets.json
+# Reference docs (agent0-ts implementation reference)
+docs/reference/
+# Internal runlogs/audits (do not publish)
+docs/e2e-indexers-integrity-audit.md
+docs/e2e-indexers-runlog.md
+docs/e2e-sdk-runlog.md
+
+# Local check scripts
+check-pda.ts
+check-volatility.ts
+compare-accounts.ts
+test-atom-tier.ts
+test-complete-e2e.ts
+test-e2e-supabase.ts
+.test-wallets.json
+tests/e2e-browser/.next/
+scripts/*.ts
+.test-wallets/
+
+# Audit files (local only)
+audit.md
+formal.md
+# Local SDK coverage tracking (assistant working file)
+suivi-sdk.md
+# Local assistant settings (may contain secrets)
+.claude/settings.local.json
+.claude/CLAUDE.md
+artifacts/

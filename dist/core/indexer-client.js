@@ -1,0 +1,1283 @@
+/**
+ * Indexer Client for Supabase PostgREST API
+ * Provides fast read access to indexed agent data
+ */
+import { IndexerError, IndexerErrorCode, IndexerUnavailableError, IndexerTimeoutError, IndexerRateLimitError, IndexerUnauthorizedError, } from './indexer-errors.js';
+import { decompressBase64Value } from '../utils/compression.js';
+const VALIDATION_ARCHIVED_ERROR = 'Validation feature is archived (v0.5.0+) and is not exposed by indexers.';
+const CID_V1_BASE32_PATTERN = /^b[a-z2-7]{20,}$/;
+function normalizeCollectionPointerForRead(pointer) {
+    const trimmed = pointer.trim();
+    if (!trimmed) {
+        throw new IndexerError('Collection pointer cannot be empty', IndexerErrorCode.INVALID_RESPONSE);
+    }
+    if (trimmed.startsWith('c1:'))
+        return trimmed;
+    if (CID_V1_BASE32_PATTERN.test(trimmed))
+        return `c1:${trimmed}`;
+    return trimmed;
+}
+function normalizeSequentialIdForRead(value, fieldName) {
+    let parsed;
+    if (typeof value === 'bigint') {
+        parsed = value;
+    }
+    else if (typeof value === 'number') {
+        if (!Number.isSafeInteger(value)) {
+            throw new IndexerError(`${fieldName} must be an integer (use string/bigint for large values)`, IndexerErrorCode.INVALID_RESPONSE);
+        }
+        parsed = BigInt(value);
+    }
+    else if (typeof value === 'string') {
+        const normalizedInput = value.trim();
+        const trimmed = normalizedInput.startsWith('sol:')
+            ? normalizedInput.slice(4).trim()
+            : normalizedInput;
+        if (!/^-?\d+$/.test(trimmed)) {
+            throw new IndexerError(`${fieldName} must be an integer`, IndexerErrorCode.INVALID_RESPONSE);
+        }
+        parsed = BigInt(trimmed);
+    }
+    else {
+        throw new IndexerError(`${fieldName} must be an integer`, IndexerErrorCode.INVALID_RESPONSE);
+    }
+    if (parsed < 0n) {
+        throw new IndexerError(`${fieldName} must be >= 0`, IndexerErrorCode.INVALID_RESPONSE);
+    }
+    return parsed.toString();
+}
+function normalizePositiveSequentialIdFromResponse(value, fieldName) {
+    let parsed;
+    if (typeof value === 'bigint') {
+        parsed = value;
+    }
+    else if (typeof value === 'number') {
+        if (!Number.isSafeInteger(value)) {
+            throw new IndexerError(`${fieldName} must be a positive integer string`, IndexerErrorCode.INVALID_RESPONSE);
+        }
+        parsed = BigInt(value);
+    }
+    else if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (!/^-?\d+$/.test(trimmed)) {
+            throw new IndexerError(`${fieldName} must be a positive integer string`, IndexerErrorCode.INVALID_RESPONSE);
+        }
+        parsed = BigInt(trimmed);
+    }
+    else {
+        throw new IndexerError(`${fieldName} must be a positive integer string`, IndexerErrorCode.INVALID_RESPONSE);
+    }
+    if (parsed <= 0n) {
+        throw new IndexerError(`${fieldName} must be a positive integer string`, IndexerErrorCode.INVALID_RESPONSE);
+    }
+    return parsed.toString();
+}
+function deriveReadyUrlFromRestBase(baseUrl) {
+    try {
+        const url = new URL(baseUrl);
+        const pathname = url.pathname.replace(/\/+$/, '');
+        const rootPath = pathname.endsWith('/rest/v1')
+            ? pathname.slice(0, -'/rest/v1'.length)
+            : pathname;
+        url.pathname = `${rootPath || ''}/ready`;
+        url.search = '';
+        url.hash = '';
+        return url.toString();
+    }
+    catch {
+        return null;
+    }
+}
+function normalizeFeedbackRowId(row) {
+    if (typeof row.asset === 'string' &&
+        typeof row.client_address === 'string' &&
+        row.feedback_index !== null &&
+        row.feedback_index !== undefined) {
+        return {
+            ...row,
+            id: encodeCanonicalFeedbackId(row.asset, row.client_address, row.feedback_index),
+        };
+    }
+    return row;
+}
+function normalizeFeedbackResponseRowId(row) {
+    if (typeof row.asset === 'string' &&
+        typeof row.client_address === 'string' &&
+        row.feedback_index !== null &&
+        row.feedback_index !== undefined &&
+        typeof row.responder === 'string' &&
+        row.responder.length > 0) {
+        const sequenceOrSig = row.tx_signature || row.response_count;
+        if (sequenceOrSig !== null && sequenceOrSig !== undefined && `${sequenceOrSig}`.length > 0) {
+            return {
+                ...row,
+                id: encodeCanonicalResponseId(row.asset, row.client_address, row.feedback_index, row.responder, sequenceOrSig),
+            };
+        }
+    }
+    return row;
+}
+export function encodeCanonicalFeedbackId(asset, client, index) {
+    return `${asset}:${client}:${index.toString()}`;
+}
+export function decodeCanonicalFeedbackId(id) {
+    const parts = id.split(':');
+    if (parts.length === 3) {
+        const [asset, client, index] = parts;
+        if (asset === 'sol')
+            return null;
+        if (!asset || !client || !index)
+            return null;
+        return { asset, client, index };
+    }
+    if (parts.length === 4 && parts[0] === 'sol') {
+        const [, asset, client, index] = parts;
+        if (!asset || !client || !index)
+            return null;
+        return { asset, client, index };
+    }
+    return null;
+}
+export function encodeCanonicalResponseId(asset, client, index, responder, sequenceOrSig) {
+    return `${asset}:${client}:${index.toString()}:${responder}:${sequenceOrSig.toString()}`;
+}
+export function decodeCanonicalResponseId(id) {
+    const parts = id.split(':');
+    if (parts.length === 5) {
+        const [asset, client, index, responder, sequenceOrSig] = parts;
+        if (asset === 'sol')
+            return null;
+        if (!asset || !client || !index || !responder)
+            return null;
+        return { asset, client, index, responder, sequenceOrSig: sequenceOrSig ?? '' };
+    }
+    if (parts.length === 6 && parts[0] === 'sol') {
+        const [, asset, client, index, responder, sequenceOrSig] = parts;
+        if (!asset || !client || !index || !responder)
+            return null;
+        return { asset, client, index, responder, sequenceOrSig: sequenceOrSig ?? '' };
+    }
+    return null;
+}
+// ============================================================================
+// IndexerClient Implementation
+// ============================================================================
+/**
+ * Client for interacting with Supabase indexer
+ */
+export class IndexerClient {
+    baseUrl;
+    baseUrls;
+    apiKey;
+    timeout;
+    retries;
+    constructor(config) {
+        this.baseUrls = (Array.isArray(config.baseUrl) ? config.baseUrl : [config.baseUrl])
+            .map((url) => url.trim().replace(/\/$/, ''))
+            .filter((url, index, list) => url.length > 0 && list.indexOf(url) === index);
+        if (this.baseUrls.length === 0) {
+            throw new IndexerError('At least one REST baseUrl is required', IndexerErrorCode.INVALID_RESPONSE);
+        }
+        this.baseUrl = this.baseUrls[0];
+        this.apiKey = config.apiKey || '';
+        this.timeout = config.timeout || 10000;
+        this.retries = config.retries ?? 2;
+    }
+    getBaseUrl() {
+        return this.baseUrl;
+    }
+    shouldFallbackEndpoint(error) {
+        if (error instanceof IndexerRateLimitError)
+            return true;
+        if (error instanceof IndexerTimeoutError)
+            return true;
+        if (error instanceof IndexerUnavailableError)
+            return true;
+        if (error instanceof IndexerError && error.code === IndexerErrorCode.SERVER_ERROR)
+            return true;
+        return false;
+    }
+    async requestAgainstBaseUrl(baseUrl, endpoint, options = {}) {
+        const url = `${baseUrl}${endpoint}`;
+        const headers = {
+            'Content-Type': 'application/json',
+        };
+        if (this.apiKey) {
+            headers.apikey = this.apiKey;
+            headers.Authorization = `Bearer ${this.apiKey}`;
+        }
+        if (options.headers instanceof Headers) {
+            options.headers.forEach((value, key) => {
+                headers[key] = value;
+            });
+        }
+        else if (Array.isArray(options.headers)) {
+            for (const [key, value] of options.headers) {
+                headers[key] = value;
+            }
+        }
+        else if (options.headers) {
+            Object.assign(headers, options.headers);
+        }
+        let lastError = null;
+        for (let attempt = 0; attempt <= this.retries; attempt++) {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+                const response = await fetch(url, {
+                    ...options,
+                    headers,
+                    signal: controller.signal,
+                    redirect: 'error',
+                });
+                clearTimeout(timeoutId);
+                if (!response.ok) {
+                    if (response.status === 401) {
+                        throw new IndexerUnauthorizedError();
+                    }
+                    if (response.status === 429) {
+                        const retryAfter = response.headers.get('Retry-After');
+                        throw new IndexerRateLimitError('Rate limited', retryAfter ? parseInt(retryAfter, 10) : undefined);
+                    }
+                    if (response.status >= 500) {
+                        throw new IndexerError(`Server error: ${response.status}`, IndexerErrorCode.SERVER_ERROR);
+                    }
+                    throw new IndexerError(`HTTP ${response.status}: ${response.statusText}`, IndexerErrorCode.INVALID_RESPONSE);
+                }
+                return (await response.json());
+            }
+            catch (error) {
+                lastError = error;
+                if (error instanceof IndexerError) {
+                    if (error.code === IndexerErrorCode.UNAUTHORIZED ||
+                        error.code === IndexerErrorCode.INVALID_RESPONSE) {
+                        throw error;
+                    }
+                }
+                if (error instanceof Error && error.name === 'AbortError') {
+                    lastError = new IndexerTimeoutError();
+                }
+                if (error instanceof TypeError && error.message.includes('fetch')) {
+                    lastError = new IndexerUnavailableError(error.message);
+                }
+                if (attempt < this.retries && this.shouldFallbackEndpoint(lastError)) {
+                    await new Promise((resolve) => setTimeout(resolve, 100 * Math.pow(2, attempt)));
+                    continue;
+                }
+                throw lastError || new IndexerUnavailableError();
+            }
+        }
+        throw new IndexerUnavailableError();
+    }
+    // ============================================================================
+    // HTTP Helpers
+    // ============================================================================
+    /**
+     * Execute HTTP request with retries and error handling
+     */
+    async request(endpoint, options = {}) {
+        let lastError = null;
+        for (const baseUrl of this.baseUrls) {
+            try {
+                return await this.requestAgainstBaseUrl(baseUrl, endpoint, options);
+            }
+            catch (error) {
+                lastError = error;
+                if (!this.shouldFallbackEndpoint(error)) {
+                    throw error;
+                }
+            }
+        }
+        throw lastError || new IndexerUnavailableError();
+    }
+    /**
+     * Build query string from params using URLSearchParams for safety
+     */
+    buildQuery(params) {
+        const searchParams = new URLSearchParams();
+        for (const [key, value] of Object.entries(params)) {
+            if (value !== undefined) {
+                searchParams.append(key, String(value));
+            }
+        }
+        const queryString = searchParams.toString();
+        return queryString ? `?${queryString}` : '';
+    }
+    parseCountValue(value, fallback, fieldName = 'count') {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            if (!Number.isSafeInteger(value)) {
+                throw new IndexerError(`${fieldName} exceeds JS safe integer range`, IndexerErrorCode.INVALID_RESPONSE);
+            }
+            return Math.max(0, Math.trunc(value));
+        }
+        if (typeof value === 'string' && /^-?\d+$/.test(value)) {
+            try {
+                const n = BigInt(value);
+                if (n < 0n)
+                    return 0;
+                if (n > BigInt(Number.MAX_SAFE_INTEGER)) {
+                    throw new IndexerError(`${fieldName} exceeds JS safe integer range`, IndexerErrorCode.INVALID_RESPONSE);
+                }
+                return Number(n);
+            }
+            catch (error) {
+                if (error instanceof IndexerError) {
+                    throw error;
+                }
+                return fallback;
+            }
+        }
+        return fallback;
+    }
+    getReplayEventCount(chainType, event) {
+        if (chainType === 'feedback') {
+            return this.parseCountValue(event.feedback_index, 0, 'feedback_index');
+        }
+        if (chainType === 'response') {
+            return this.parseCountValue(event.response_count, 0, 'response_count');
+        }
+        return this.parseCountValue(event.revoke_count, 0, 'revoke_count');
+    }
+    async getReplayEventAt(asset, chainType, count) {
+        if (!Number.isFinite(count) || count < 0)
+            return null;
+        if (chainType !== 'feedback' && count < 1)
+            return null;
+        const page = await this.getReplayData(asset, chainType, count, count + 1, 1);
+        const event = page.events[0];
+        if (!event)
+            return null;
+        return this.getReplayEventCount(chainType, event) === count ? event : null;
+    }
+    async getLastReplayDigest(asset, chainType) {
+        const cache = new Map();
+        const firstCount = chainType === 'feedback' ? 0 : 1;
+        const load = async (count) => {
+            if (!cache.has(count)) {
+                cache.set(count, await this.getReplayEventAt(asset, chainType, count));
+            }
+            return cache.get(count) ?? null;
+        };
+        const firstEvent = await load(firstCount);
+        if (!firstEvent) {
+            return { digest: null, count: 0 };
+        }
+        let low = firstCount;
+        let high = chainType === 'feedback' ? 1 : 2;
+        while (await load(high)) {
+            low = high;
+            high *= 2;
+        }
+        while (low + 1 < high) {
+            const mid = low + Math.floor((high - low) / 2);
+            if (await load(mid)) {
+                low = mid;
+            }
+            else {
+                high = mid;
+            }
+        }
+        const lastEvent = await load(low);
+        return {
+            digest: lastEvent?.running_digest ?? null,
+            count: chainType === 'feedback' ? low + 1 : low,
+        };
+    }
+    async resolveCollectionCreatorScope(normalizedCollection, creator, methodName) {
+        const direct = creator?.trim();
+        if (direct)
+            return direct;
+        const pointers = await this.getCollectionPointers({
+            collection: normalizedCollection,
+            col: normalizedCollection,
+            limit: 2,
+            offset: 0,
+        });
+        const uniqueCreators = Array.from(new Set(pointers
+            .map((p) => p.creator?.trim())
+            .filter((v) => !!v)));
+        if (uniqueCreators.length === 1) {
+            return uniqueCreators[0];
+        }
+        if (uniqueCreators.length > 1) {
+            throw new IndexerError(`${methodName} requires creator (scope is creator+collection): multiple creators found for ${normalizedCollection}.`, IndexerErrorCode.INVALID_RESPONSE);
+        }
+        throw new IndexerError(`${methodName} requires creator (scope is creator+collection).`, IndexerErrorCode.INVALID_RESPONSE);
+    }
+    shouldUseLegacyCollectionRead(error) {
+        return (error instanceof IndexerError
+            && error.code === IndexerErrorCode.INVALID_RESPONSE
+            && /HTTP 400|HTTP 404/.test(error.message));
+    }
+    shouldUsePublicRestReadFallback(error) {
+        return (error instanceof IndexerError
+            && error.code === IndexerErrorCode.INVALID_RESPONSE
+            && /HTTP 403|HTTP 404|HTTP 405/.test(error.message));
+    }
+    normalizeCollectionRecord(row) {
+        const collection = typeof row?.collection === 'string' ? row.collection : row?.col;
+        const col = typeof row?.col === 'string' ? row.col : collection;
+        const collectionId = row?.collection_id ?? row?.collectionId;
+        return {
+            collection_id: collectionId !== undefined && collectionId !== null
+                ? normalizePositiveSequentialIdFromResponse(collectionId, 'collection_id')
+                : null,
+            collection: collection ?? col ?? '',
+            col: col ?? collection ?? '',
+            creator: row?.creator ?? '',
+            first_seen_asset: row?.first_seen_asset ?? row?.firstSeenAsset ?? '',
+            first_seen_at: row?.first_seen_at ?? row?.firstSeenAt ?? new Date(0).toISOString(),
+            first_seen_slot: String(row?.first_seen_slot ?? row?.firstSeenSlot ?? '0'),
+            first_seen_tx_signature: row?.first_seen_tx_signature ?? row?.firstSeenTxSignature ?? null,
+            last_seen_at: row?.last_seen_at ?? row?.lastSeenAt ?? new Date(0).toISOString(),
+            last_seen_slot: String(row?.last_seen_slot ?? row?.lastSeenSlot ?? '0'),
+            last_seen_tx_signature: row?.last_seen_tx_signature ?? row?.lastSeenTxSignature ?? null,
+            asset_count: String(row?.asset_count ?? row?.assetCount ?? '0'),
+            version: row?.version ?? null,
+            name: row?.name ?? null,
+            symbol: row?.symbol ?? null,
+            description: row?.description ?? null,
+            image: row?.image ?? null,
+            banner_image: row?.banner_image ?? row?.bannerImage ?? null,
+            social_website: row?.social_website ?? row?.socialWebsite ?? null,
+            social_x: row?.social_x ?? row?.socialX ?? null,
+            social_discord: row?.social_discord ?? row?.socialDiscord ?? null,
+            metadata_status: row?.metadata_status ?? row?.metadataStatus ?? null,
+            metadata_hash: row?.metadata_hash ?? row?.metadataHash ?? null,
+            metadata_bytes: row?.metadata_bytes ?? row?.metadataBytes ?? null,
+            metadata_updated_at: row?.metadata_updated_at ?? row?.metadataUpdatedAt ?? null,
+        };
+    }
+    // ============================================================================
+    // Health Check
+    // ============================================================================
+    /**
+     * Check if indexer is available
+     */
+    async isAvailable() {
+        try {
+            for (const baseUrl of this.baseUrls) {
+                const readyUrl = deriveReadyUrlFromRestBase(baseUrl);
+                if (readyUrl) {
+                    try {
+                        const headers = {};
+                        if (this.apiKey) {
+                            headers.apikey = this.apiKey;
+                            headers.Authorization = `Bearer ${this.apiKey}`;
+                        }
+                        const response = await fetch(readyUrl, { headers, redirect: 'error' });
+                        if (response.ok || response.status === 503) {
+                            let payload = null;
+                            try {
+                                payload = await response.json();
+                            }
+                            catch {
+                                payload = null;
+                            }
+                            if (payload?.status === 'ready') {
+                                return true;
+                            }
+                            continue;
+                        }
+                    }
+                    catch {
+                        // Fall through to the legacy accessibility probe for this endpoint.
+                    }
+                }
+                try {
+                    await this.requestAgainstBaseUrl(baseUrl, '/agents?limit=1');
+                    return true;
+                }
+                catch {
+                    // Try next configured endpoint.
+                }
+            }
+        }
+        catch {
+            return false;
+        }
+        return false;
+    }
+    /**
+     * Get count for a resource using Prefer: count=exact header (PostgREST standard)
+     * Parses Content-Range header: "0-99/1234" -> 1234
+     */
+    async getCount(resource, filters) {
+        const query = this.buildQuery({ ...filters, limit: 1 });
+        let lastError = null;
+        for (const baseUrl of this.baseUrls) {
+            const url = `${baseUrl}/${resource}${query}`;
+            for (let attempt = 0; attempt <= this.retries; attempt++) {
+                try {
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+                    const countHeaders = {
+                        Prefer: 'count=exact',
+                    };
+                    if (this.apiKey) {
+                        countHeaders.apikey = this.apiKey;
+                        countHeaders.Authorization = `Bearer ${this.apiKey}`;
+                    }
+                    const response = await fetch(url, {
+                        headers: countHeaders,
+                        signal: controller.signal,
+                        redirect: 'error',
+                    });
+                    clearTimeout(timeoutId);
+                    if (!response.ok) {
+                        if (response.status === 401) {
+                            throw new IndexerUnauthorizedError();
+                        }
+                        if (response.status === 429) {
+                            const retryAfter = response.headers.get('Retry-After');
+                            throw new IndexerRateLimitError('Rate limited', retryAfter ? parseInt(retryAfter, 10) : undefined);
+                        }
+                        throw new IndexerError(`getCount failed: HTTP ${response.status}`, response.status >= 500 ? IndexerErrorCode.SERVER_ERROR : IndexerErrorCode.INVALID_RESPONSE);
+                    }
+                    const contentRange = response.headers.get('Content-Range');
+                    if (contentRange) {
+                        const match = contentRange.match(/\/(\d+)$/);
+                        if (match) {
+                            return parseInt(match[1], 10);
+                        }
+                    }
+                    const data = await response.json();
+                    return Array.isArray(data) ? data.length : 0;
+                }
+                catch (error) {
+                    lastError = error instanceof Error ? error : new Error(String(error));
+                    if (error instanceof Error && error.name === 'AbortError') {
+                        lastError = new IndexerTimeoutError();
+                    }
+                    else if (error instanceof TypeError && error.message.includes('fetch')) {
+                        lastError = new IndexerUnavailableError(error.message);
+                    }
+                    if (error instanceof IndexerError && !this.shouldFallbackEndpoint(error)) {
+                        throw error;
+                    }
+                    if (attempt < this.retries && this.shouldFallbackEndpoint(lastError)) {
+                        await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt)));
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        throw lastError instanceof IndexerError
+            ? lastError
+            : new IndexerUnavailableError(lastError?.message ?? 'getCount failed after retries');
+    }
+    // ============================================================================
+    // Agents
+    // ============================================================================
+    /**
+     * Get agent by asset pubkey
+     */
+    async getAgent(asset) {
+        const query = this.buildQuery({ asset: `eq.${asset}` });
+        const result = await this.request(`/agents${query}`);
+        return result.length > 0 ? result[0] : null;
+    }
+    /**
+     * Get agent by indexer agent_id
+     */
+    async getAgentByAgentId(agentId) {
+        const id = normalizeSequentialIdForRead(agentId, 'agentId');
+        const query = this.buildQuery({ agent_id: `eq.${id}` });
+        const result = await this.request(`/agents${query}`);
+        return result.length > 0 ? result[0] : null;
+    }
+    /** @deprecated Use getAgentByAgentId(agentId) */
+    async getAgentByIndexerId(agentId) {
+        return this.getAgentByAgentId(agentId);
+    }
+    /**
+     * Get all agents with pagination
+     */
+    async getAgents(options) {
+        const updatedAt = options?.updatedAt !== undefined ? String(options.updatedAt) : undefined;
+        const updatedAtGt = options?.updatedAtGt !== undefined ? String(options.updatedAtGt) : undefined;
+        const updatedAtLt = options?.updatedAtLt !== undefined ? String(options.updatedAtLt) : undefined;
+        const query = this.buildQuery({
+            limit: options?.limit,
+            offset: options?.offset,
+            order: options?.order || 'created_at.desc',
+            owner: options?.owner ? `eq.${options.owner}` : undefined,
+            creator: options?.creator ? `eq.${options.creator}` : undefined,
+            collection: options?.collection ? `eq.${options.collection}` : undefined,
+            collection_pointer: options?.collectionPointer ? `eq.${options.collectionPointer}` : undefined,
+            agent_wallet: options?.wallet ? `eq.${options.wallet}` : undefined,
+            parent_asset: options?.parentAsset ? `eq.${options.parentAsset}` : undefined,
+            parent_creator: options?.parentCreator ? `eq.${options.parentCreator}` : undefined,
+            col_locked: options?.colLocked !== undefined ? `eq.${options.colLocked}` : undefined,
+            parent_locked: options?.parentLocked !== undefined ? `eq.${options.parentLocked}` : undefined,
+            updated_at: updatedAt ? `eq.${updatedAt}` : undefined,
+            updated_at_gt: updatedAtGt,
+            updated_at_lt: updatedAtLt,
+        });
+        return this.request(`/agents${query}`);
+    }
+    /**
+     * Get agents by owner
+     */
+    async getAgentsByOwner(owner) {
+        const query = this.buildQuery({ owner: `eq.${owner}` });
+        return this.request(`/agents${query}`);
+    }
+    /**
+     * Get agents by collection
+     */
+    async getAgentsByCollection(collection) {
+        const query = this.buildQuery({ collection: `eq.${collection}` });
+        return this.request(`/agents${query}`);
+    }
+    /**
+     * Get agent by operational wallet
+     */
+    async getAgentByWallet(wallet) {
+        const query = this.buildQuery({ agent_wallet: `eq.${wallet}` });
+        const result = await this.request(`/agents${query}`);
+        return result.length > 0 ? result[0] : null;
+    }
+    // ============================================================================
+    // Reputation (agent_reputation view)
+    // ============================================================================
+    /**
+     * Get reputation for a specific agent
+     */
+    async getAgentReputation(asset) {
+        const query = this.buildQuery({ asset: `eq.${asset}` });
+        const result = await this.request(`/agent_reputation${query}`);
+        return result.length > 0 ? result[0] : null;
+    }
+    /**
+     * Get leaderboard (top agents by sort_key)
+     * Uses keyset pagination for efficient queries at scale
+     * @param options.collection - Filter by collection
+     * @param options.minTier - Minimum trust tier (0-4)
+     * @param options.limit - Max results (default 50)
+     * @param options.cursorSortKey - Cursor for keyset pagination (get next page)
+     */
+    async getLeaderboard(options) {
+        if (options?.cursorSortKey) {
+            return this.getLeaderboardRPC(options);
+        }
+        const params = new URLSearchParams();
+        params.set('limit', String(options?.limit || 50));
+        if (options?.collection)
+            params.set('collection', `eq.${options.collection}`);
+        const rows = await this.request(`/leaderboard?${params.toString()}`);
+        if (options?.minTier === undefined) {
+            return rows;
+        }
+        return rows.filter((row) => this.parseCountValue(row.trust_tier, 0, 'trust_tier') >= options.minTier);
+    }
+    /**
+     * Get leaderboard via RPC function (optimized for large datasets)
+     * Uses PostgreSQL get_leaderboard() function
+     */
+    async getLeaderboardRPC(options) {
+        // Note: p_cursor_sort_key is passed as string to avoid BigInt JSON.stringify crash
+        // PostgreSQL will cast it to BIGINT on the server side
+        const body = {
+            p_collection: options?.collection || null,
+            p_min_tier: options?.minTier ?? 0,
+            p_limit: options?.limit || 50,
+            p_cursor_sort_key: options?.cursorSortKey || null,
+        };
+        return this.request('/rpc/get_leaderboard', {
+            method: 'POST',
+            body: JSON.stringify(body),
+        });
+    }
+    // ============================================================================
+    // Feedbacks
+    // ============================================================================
+    /**
+     * Get feedbacks for an agent
+     */
+    async getFeedbacks(asset, options) {
+        const params = {
+            asset: `eq.${asset}`,
+            order: 'feedback_id.desc',
+            limit: options?.limit,
+            offset: options?.offset,
+        };
+        if (!options?.includeRevoked) {
+            params.is_revoked = 'eq.false';
+        }
+        const query = this.buildQuery(params);
+        const rows = await this.request(`/feedbacks${query}`);
+        return rows.map((row) => normalizeFeedbackRowId(row));
+    }
+    /**
+     * Get single feedback by asset, client, and index
+     * v0.4.1 - Added to fix audit finding #1 (HIGH): readFeedback must filter by client
+     */
+    async getFeedback(asset, client, feedbackIndex) {
+        const query = this.buildQuery({
+            asset: `eq.${asset}`,
+            client_address: `eq.${client}`,
+            feedback_index: `eq.${feedbackIndex.toString()}`,
+            limit: 1,
+        });
+        const results = await this.request(`/feedbacks${query}`);
+        return results.length > 0 ? normalizeFeedbackRowId(results[0]) : null;
+    }
+    /**
+     * Get a single feedback by feedback identifier.
+     * Accepts canonical `asset:client:index` ids and legacy sequential numeric backend feedback ids.
+     */
+    async getFeedbackById(feedbackId) {
+        const normalizedId = feedbackId.trim();
+        const canonical = decodeCanonicalFeedbackId(normalizedId);
+        if (canonical) {
+            return this.getFeedback(canonical.asset, canonical.client, BigInt(canonical.index));
+        }
+        if (!/^\d+$/.test(normalizedId))
+            return null;
+        const byIdQuery = this.buildQuery({
+            feedback_id: `eq.${normalizedId}`,
+            limit: 2,
+        });
+        const byId = await this.request(`/feedbacks${byIdQuery}`);
+        if (byId.length > 1) {
+            throw new Error('Ambiguous feedback id.');
+        }
+        return byId.length === 1 ? normalizeFeedbackRowId(byId[0]) : null;
+    }
+    /**
+     * Get feedbacks by client
+     */
+    async getFeedbacksByClient(client) {
+        const query = this.buildQuery({
+            client_address: `eq.${client}`,
+            order: 'feedback_id.desc',
+        });
+        const rows = await this.request(`/feedbacks${query}`);
+        return rows.map((row) => normalizeFeedbackRowId(row));
+    }
+    /**
+     * Get feedbacks by tag
+     */
+    async getFeedbacksByTag(tag) {
+        // Search in both tag1 and tag2
+        const query = `?or=(tag1.eq.${encodeURIComponent(tag)},tag2.eq.${encodeURIComponent(tag)})&order=feedback_id.desc`;
+        const rows = await this.request(`/feedbacks${query}`);
+        return rows.map((row) => normalizeFeedbackRowId(row));
+    }
+    /**
+     * Get feedbacks by endpoint
+     */
+    async getFeedbacksByEndpoint(endpoint) {
+        const query = this.buildQuery({
+            endpoint: `eq.${endpoint}`,
+            order: 'feedback_id.desc',
+        });
+        const rows = await this.request(`/feedbacks${query}`);
+        return rows.map((row) => normalizeFeedbackRowId(row));
+    }
+    /**
+     * Get ALL feedbacks across all agents (bulk query)
+     * Optimized for fetchAllFeedbacks - single query instead of N+1
+     * @param options - Query options
+     * @returns Array of all feedbacks (grouped by caller)
+     */
+    async getAllFeedbacks(options) {
+        const params = {
+            order: 'asset,feedback_index.asc',
+            limit: options?.limit || 5000,
+        };
+        if (!options?.includeRevoked) {
+            params.is_revoked = 'eq.false';
+        }
+        const query = this.buildQuery(params);
+        const rows = await this.request(`/feedbacks${query}`);
+        return rows.map((row) => normalizeFeedbackRowId(row));
+    }
+    async getLastFeedbackIndex(asset, client) {
+        const query = this.buildQuery({
+            asset: `eq.${asset}`,
+            client_address: `eq.${client}`,
+            select: 'feedback_index',
+            order: 'feedback_index.desc',
+            limit: 1,
+        });
+        const results = await this.request(`/feedbacks${query}`);
+        if (results.length === 0)
+            return -1n;
+        return BigInt(results[0].feedback_index);
+    }
+    // ============================================================================
+    // Metadata
+    // ============================================================================
+    /**
+     * Get all metadata for an agent
+     * Values are automatically decompressed if stored with ZSTD
+     */
+    async getMetadata(asset) {
+        const query = this.buildQuery({ asset: `eq.${asset}` });
+        const result = await this.request(`/metadata${query}`);
+        return this.decompressMetadataValues(result);
+    }
+    /**
+     * Get specific metadata entry by key
+     * Value is automatically decompressed if stored with ZSTD
+     */
+    async getMetadataByKey(asset, key) {
+        const query = this.buildQuery({
+            asset: `eq.${asset}`,
+            key: `eq.${key}`,
+        });
+        const result = await this.request(`/metadata${query}`);
+        if (result.length === 0)
+            return null;
+        const decompressed = await this.decompressMetadataValues(result);
+        return decompressed[0];
+    }
+    /**
+     * Decompress metadata values (handles ZSTD compression)
+     * @internal
+     */
+    async decompressMetadataValues(metadata) {
+        return Promise.all(metadata.map(async (m) => {
+            try {
+                // Value comes as base64 from Supabase PostgREST (BYTEA encoding)
+                // or as plain string from local API
+                const decompressedValue = m.value
+                    ? await decompressBase64Value(m.value)
+                    : '';
+                return { ...m, value: decompressedValue };
+            }
+            catch {
+                // If decompression fails, return original value
+                // (might be legacy uncompressed data or already decoded)
+                return m;
+            }
+        }));
+    }
+    // ============================================================================
+    // Validations
+    // ============================================================================
+    /**
+     * Get validations for an agent
+     */
+    async getValidations(_asset) {
+        throw new Error(VALIDATION_ARCHIVED_ERROR);
+    }
+    /**
+     * Get validations by validator
+     */
+    async getValidationsByValidator(_validator) {
+        throw new Error(VALIDATION_ARCHIVED_ERROR);
+    }
+    /**
+     * Get pending validations for a validator
+     */
+    async getPendingValidations(_validator) {
+        throw new Error(VALIDATION_ARCHIVED_ERROR);
+    }
+    /**
+     * Get a specific validation by asset, validator, and nonce
+     * Returns full validation data including URIs (not available on-chain)
+     */
+    async getValidation(_asset, _validator, _nonce) {
+        throw new Error(VALIDATION_ARCHIVED_ERROR);
+    }
+    // ============================================================================
+    // Stats (Views)
+    // ============================================================================
+    /**
+     * Get canonical collection pointer rows.
+     */
+    async getCollectionPointers(options) {
+        const collectionId = options?.collectionId !== undefined
+            ? normalizeSequentialIdForRead(options.collectionId, 'collectionId')
+            : undefined;
+        const hasCollectionFilter = options?.collection !== undefined || options?.col !== undefined;
+        const collection = hasCollectionFilter
+            ? normalizeCollectionPointerForRead(options?.collection ?? options?.col ?? '')
+            : undefined;
+        const primaryQuery = this.buildQuery({
+            collection_id: collectionId ? `eq.${collectionId}` : undefined,
+            collection: collection ? `eq.${collection}` : undefined,
+            creator: options?.creator ? `eq.${options.creator}` : undefined,
+            first_seen_asset: options?.firstSeenAsset ? `eq.${options.firstSeenAsset}` : undefined,
+            limit: options?.limit,
+            offset: options?.offset,
+        });
+        try {
+            const rows = await this.request(`/collections${primaryQuery}`);
+            return rows.map((row) => this.normalizeCollectionRecord(row));
+        }
+        catch (error) {
+            if (collectionId !== undefined) {
+                throw error;
+            }
+            if (!this.shouldUseLegacyCollectionRead(error)) {
+                throw error;
+            }
+            const legacyQuery = this.buildQuery({
+                col: collection ? `eq.${collection}` : undefined,
+                creator: options?.creator ? `eq.${options.creator}` : undefined,
+                first_seen_asset: options?.firstSeenAsset ? `eq.${options.firstSeenAsset}` : undefined,
+                limit: options?.limit,
+                offset: options?.offset,
+            });
+            const rows = await this.request(`/collection_pointers${legacyQuery}`);
+            return rows.map((row) => this.normalizeCollectionRecord(row));
+        }
+    }
+    /**
+     * Count assets attached to a collection pointer (scoped by creator).
+     */
+    async getCollectionAssetCount(col, creator) {
+        const normalizedCollection = normalizeCollectionPointerForRead(col);
+        const creatorScope = await this.resolveCollectionCreatorScope(normalizedCollection, creator, 'getCollectionAssetCount');
+        const primaryQuery = this.buildQuery({
+            collection: `eq.${normalizedCollection}`,
+            creator: `eq.${creatorScope}`,
+        });
+        try {
+            const row = await this.request(`/collection_asset_count${primaryQuery}`);
+            return this.parseCountValue(row?.asset_count, 0, 'asset_count');
+        }
+        catch (error) {
+            if (!this.shouldUseLegacyCollectionRead(error)) {
+                throw error;
+            }
+            const legacyQuery = this.buildQuery({
+                col: `eq.${normalizedCollection}`,
+                creator: `eq.${creatorScope}`,
+            });
+            const row = await this.request(`/collection_asset_count${legacyQuery}`);
+            return this.parseCountValue(row?.asset_count, 0, 'asset_count');
+        }
+    }
+    /**
+     * Get assets by collection pointer (scoped by creator).
+     */
+    async getCollectionAssets(col, options) {
+        const normalizedCollection = normalizeCollectionPointerForRead(col);
+        const creatorScope = await this.resolveCollectionCreatorScope(normalizedCollection, options?.creator, 'getCollectionAssets');
+        const primaryQuery = this.buildQuery({
+            collection: `eq.${normalizedCollection}`,
+            creator: `eq.${creatorScope}`,
+            limit: options?.limit,
+            offset: options?.offset,
+            order: options?.order,
+        });
+        try {
+            return await this.request(`/collection_assets${primaryQuery}`);
+        }
+        catch (error) {
+            if (!this.shouldUseLegacyCollectionRead(error)) {
+                throw error;
+            }
+            const legacyQuery = this.buildQuery({
+                col: `eq.${normalizedCollection}`,
+                creator: `eq.${creatorScope}`,
+                limit: options?.limit,
+                offset: options?.offset,
+                order: options?.order,
+            });
+            return this.request(`/collection_assets${legacyQuery}`);
+        }
+    }
+    /**
+     * Get stats for a specific collection
+     */
+    async getCollectionStats(collection) {
+        const query = this.buildQuery({ collection: `eq.${collection}` });
+        const result = await this.request(`/collection_stats${query}`);
+        return result.length > 0 ? result[0] : null;
+    }
+    /**
+     * Get stats for all collections
+     */
+    async getAllCollectionStats() {
+        return this.request('/collection_stats?order=agent_count.desc');
+    }
+    /**
+     * Get global statistics
+     */
+    async getGlobalStats() {
+        const result = await this.request('/global_stats');
+        const fallback = {
+            total_agents: 0,
+            total_collections: 0,
+            total_feedbacks: 0,
+            platinum_agents: 0,
+            gold_agents: 0,
+            avg_quality: null,
+        };
+        const row = result[0];
+        if (!row)
+            return fallback;
+        return {
+            ...fallback,
+            ...row,
+        };
+    }
+    // ============================================================================
+    // RPC Functions
+    // ============================================================================
+    /**
+     * Get paginated agents for a collection with reputation summary
+     * Uses the get_collection_agents RPC function
+     */
+    async getCollectionAgents(collection, limit = 20, offset = 0) {
+        const query = this.buildQuery({
+            collection_id: collection,
+            page_limit: limit,
+            page_offset: offset,
+        });
+        return this.request(`/rpc/get_collection_agents${query}`);
+    }
+    // ============================================================================
+    // Feedback Responses
+    // ============================================================================
+    /**
+     * Get responses for an agent's feedbacks
+     */
+    async getFeedbackResponses(asset) {
+        const query = this.buildQuery({
+            asset: `eq.${asset}`,
+            order: 'response_id.desc',
+        });
+        const rows = await this.request(`/feedback_responses${query}`);
+        return rows.map((row) => normalizeFeedbackResponseRowId(row));
+    }
+    /**
+     * Get responses for a specific feedback (asset + client + index)
+     * @param asset - Agent asset pubkey (base58)
+     * @param client - Client pubkey (base58)
+     * @param feedbackIndex - Feedback index
+     * @param limit - Max responses to return (default: 100, prevents large payloads)
+     */
+    async getFeedbackResponsesFor(asset, client, feedbackIndex, limit = 100) {
+        const query = this.buildQuery({
+            asset: `eq.${asset}`,
+            client_address: `eq.${client}`,
+            feedback_index: `eq.${feedbackIndex.toString()}`,
+            order: 'response_id.asc',
+            limit,
+        });
+        const rows = await this.request(`/feedback_responses${query}`);
+        return rows.map((row) => normalizeFeedbackResponseRowId(row));
+    }
+    /**
+     * Get responses by feedback identifier.
+     * Accepts canonical `asset:client:index` ids and legacy sequential numeric backend feedback ids.
+     * Uses a two-step lookup for REST compatibility:
+     * 1) resolve feedback asset from `feedbacks` by `feedback_id`
+     * 2) query `feedback_responses` by `asset + feedback_id`
+     * Fails closed when a single `feedback_id` resolves to multiple assets.
+     */
+    async getFeedbackResponsesByFeedbackId(feedbackId, limit = 100) {
+        const normalizedId = feedbackId.trim();
+        const canonical = decodeCanonicalFeedbackId(normalizedId);
+        if (canonical) {
+            return this.getFeedbackResponsesFor(canonical.asset, canonical.client, BigInt(canonical.index), limit);
+        }
+        if (!/^\d+$/.test(normalizedId))
+            return [];
+        const feedbackLookupQuery = this.buildQuery({
+            feedback_id: `eq.${normalizedId}`,
+            select: 'asset',
+            limit: 2,
+        });
+        const feedbackLookup = await this.request(`/feedbacks${feedbackLookupQuery}`);
+        const assets = [
+            ...new Set(feedbackLookup
+                .map((row) => row.asset)
+                .filter((asset) => typeof asset === 'string' && asset.length > 0)),
+        ];
+        if (assets.length === 0)
+            return [];
+        if (assets.length > 1) {
+            throw new IndexerError(`Ambiguous feedback_id "${normalizedId}": multiple assets found (${assets.join(', ')}).`, IndexerErrorCode.INVALID_RESPONSE);
+        }
+        const [asset] = assets;
+        const query = this.buildQuery({
+            asset: `eq.${asset}`,
+            feedback_id: `eq.${normalizedId}`,
+            order: 'response_id.asc',
+            limit,
+        });
+        const rows = await this.request(`/feedback_responses${query}`);
+        return rows.map((row) => normalizeFeedbackResponseRowId(row));
+    }
+    async getRevocations(asset) {
+        const query = this.buildQuery({
+            asset: `eq.${asset}`,
+            order: 'revocation_id.asc',
+        });
+        return this.request(`/revocations${query}`);
+    }
+    async getLastFeedbackDigest(asset) {
+        return this.getLastReplayDigest(asset, 'feedback');
+    }
+    async getLastResponseDigest(asset) {
+        return this.getLastReplayDigest(asset, 'response');
+    }
+    async getLastRevokeDigest(asset) {
+        return this.getLastReplayDigest(asset, 'revoke');
+    }
+    // ============================================================================
+    // Spot Check Methods (for integrity verification)
+    // ============================================================================
+    /**
+     * Get feedbacks at specific indices for spot checking
+     * @param asset - Agent asset pubkey
+     * @param indices - Array of feedback indices to check
+     * @returns Map of index -> feedback (null if missing)
+     */
+    async getFeedbacksAtIndices(asset, indices) {
+        const result = new Map();
+        if (indices.length === 0)
+            return result;
+        for (const idx of indices) {
+            result.set(idx, null);
+        }
+        await Promise.all(indices.map(async (idx) => {
+            const event = await this.getReplayEventAt(asset, 'feedback', idx);
+            if (!event)
+                return;
+            result.set(idx, {
+                id: '',
+                asset,
+                client_address: event.client,
+                feedback_index: idx,
+                value: '0',
+                value_decimals: 0,
+                score: null,
+                tag1: null,
+                tag2: null,
+                endpoint: null,
+                feedback_uri: null,
+                feedback_hash: event.feedback_hash ?? null,
+                running_digest: event.running_digest,
+                is_revoked: false,
+                revoked_at: null,
+                block_slot: event.slot,
+                tx_signature: '',
+                created_at: new Date(0).toISOString(),
+            });
+        }));
+        return result;
+    }
+    /**
+     * Get responses count for an asset
+     */
+    async getResponseCount(asset) {
+        return this.getCount('feedback_responses', { asset: `eq.${asset}` });
+    }
+    /**
+     * Get responses at specific offsets for spot checking
+     * @param asset - Agent asset pubkey
+     * @param offsets - Array of offsets (0-based) to check
+     * @returns Map of offset -> response (null if missing)
+     */
+    async getResponsesAtOffsets(asset, offsets) {
+        const result = new Map();
+        if (offsets.length === 0)
+            return result;
+        for (const offset of offsets) {
+            result.set(offset, null);
+        }
+        await Promise.all(offsets.map(async (offset) => {
+            const event = await this.getReplayEventAt(asset, 'response', offset + 1);
+            if (!event)
+                return;
+            result.set(offset, {
+                id: '',
+                asset,
+                client_address: event.client,
+                feedback_index: this.parseCountValue(event.feedback_index, 0, 'feedback_index'),
+                responder: event.responder ?? '',
+                response_uri: null,
+                response_hash: event.response_hash ?? null,
+                running_digest: event.running_digest,
+                block_slot: event.slot,
+                tx_signature: '',
+                created_at: new Date(0).toISOString(),
+            });
+        }));
+        return result;
+    }
+    /**
+     * Get revocations at specific revoke counts for spot checking
+     * @param asset - Agent asset pubkey
+     * @param revokeCounts - Array of revoke counts (1-based) to check
+     * @returns Map of revokeCount -> revocation (null if missing)
+     */
+    async getRevocationsAtCounts(asset, revokeCounts) {
+        const result = new Map();
+        if (revokeCounts.length === 0)
+            return result;
+        for (const rc of revokeCounts) {
+            result.set(rc, null);
+        }
+        await Promise.all(revokeCounts.map(async (revokeCount) => {
+            const event = await this.getReplayEventAt(asset, 'revoke', revokeCount);
+            if (!event)
+                return;
+            result.set(revokeCount, {
+                id: '',
+                asset,
+                client_address: event.client,
+                feedback_index: this.parseCountValue(event.feedback_index, 0, 'feedback_index'),
+                feedback_hash: event.feedback_hash ?? null,
+                slot: event.slot,
+                original_score: null,
+                atom_enabled: false,
+                had_impact: false,
+                running_digest: event.running_digest,
+                revoke_count: revokeCount,
+                tx_signature: '',
+                created_at: new Date(0).toISOString(),
+            });
+        }));
+        return result;
+    }
+    // ============================================================================
+    // Replay Data Methods (for hash-chain full replay verification)
+    // ============================================================================
+    async getReplayData(asset, chainType, fromCount = 0, toCount = 1000, limit = 1000) {
+        const query = this.buildQuery({
+            chainType,
+            fromCount,
+            toCount,
+            limit,
+        });
+        const payload = await this.request(`/events/${asset}/replay-data${query}`);
+        const events = Array.isArray(payload)
+            ? payload
+            : Array.isArray(payload?.events)
+                ? payload.events
+                : [];
+        const hasMore = Array.isArray(payload)
+            ? events.length === limit
+            : typeof payload?.hasMore === 'boolean'
+                ? payload.hasMore
+                : events.length === limit;
+        const nextFromCount = Array.isArray(payload)
+            ? (events.length > 0 ? fromCount + events.length : fromCount)
+            : payload?.nextFromCount !== undefined
+                ? this.parseCountValue(payload.nextFromCount, fromCount, 'nextFromCount')
+                : (events.length > 0 ? fromCount + events.length : fromCount);
+        return {
+            events,
+            hasMore,
+            nextFromCount,
+        };
+    }
+    async getLatestCheckpoints(asset) {
+        return this.request(`/checkpoints/${asset}/latest`);
+    }
+    async triggerReplay(asset) {
+        return this.request(`/verify/replay/${asset}`);
+    }
+}
+//# sourceMappingURL=indexer-client.js.map

@@ -1,0 +1,183 @@
+/**
+ * Core interfaces for Agent0 SDK
+ */
+import type { AgentId, Address, URI, Timestamp } from './types.js';
+import type { ServiceType, TrustModel } from './enums.js';
+/**
+ * Represents an agent service
+ */
+export interface Service {
+    type: ServiceType;
+    value: string;
+    meta?: Record<string, unknown>;
+}
+/** @deprecated Use Service instead */
+export type Endpoint = Service;
+/**
+ * Agent registration file structure
+ * Used to build 8004 compliant metadata JSON
+ */
+export interface RegistrationFile {
+    agentId?: AgentId;
+    agentURI?: URI;
+    name: string;
+    description: string;
+    image?: URI;
+    walletAddress?: Address;
+    walletChainId?: number;
+    services: Service[];
+    trustModels?: (TrustModel | string)[];
+    owners?: Address[];
+    operators?: Address[];
+    active?: boolean;
+    x402Support?: boolean;
+    metadata?: Record<string, unknown>;
+    updatedAt?: Timestamp;
+    skills?: string[];
+    domains?: string[];
+}
+/**
+ * Summary information for agent discovery and search
+ */
+export interface AgentSummary {
+    chainId: number;
+    agentId: AgentId;
+    name: string;
+    image?: URI;
+    description: string;
+    owners: Address[];
+    operators: Address[];
+    mcp: boolean;
+    a2a: boolean;
+    ens?: string;
+    did?: string;
+    walletAddress?: Address;
+    supportedTrusts: string[];
+    a2aSkills: string[];
+    mcpTools: string[];
+    mcpPrompts: string[];
+    mcpResources: string[];
+    active: boolean;
+    x402support: boolean;
+    extras: Record<string, unknown>;
+}
+/**
+ * Feedback data structure
+ */
+export interface Feedback {
+    id: FeedbackIdTuple;
+    agentId: AgentId;
+    reviewer: Address;
+    score?: number;
+    tags: string[];
+    text?: string;
+    context?: Record<string, unknown>;
+    proofOfPayment?: Record<string, unknown>;
+    fileURI?: URI;
+    createdAt: Timestamp;
+    answers: Array<Record<string, unknown>>;
+    isRevoked: boolean;
+    capability?: string;
+    name?: string;
+    skill?: string;
+    task?: string;
+}
+/**
+ * Feedback ID tuple: [agentId, clientAddress, feedbackIndex]
+ */
+export type FeedbackIdTuple = [AgentId, Address, number];
+/**
+ * Feedback ID string format: "agentId:clientAddress:feedbackIndex"
+ */
+export type FeedbackId = string;
+/**
+ * Parameters for giveFeedback - v0.6.0 (SEAL v1)
+ *
+ * SEAL v1: The program computes the seal_hash on-chain from these parameters.
+ * feedbackFileHash is optional - only needed if you want to link to external file content.
+ */
+export interface GiveFeedbackParams {
+    /**
+     * Metric value - accepts multiple formats:
+     * - Decimal string: "99.77" → auto-encoded to value=9977, valueDecimals=2
+     * - Number: 99.77 → auto-encoded to value=9977, valueDecimals=2
+     * - Raw bigint/int: 9977n with valueDecimals=2 → used directly
+     *
+     * Supports negative values for yields, PnL, etc.
+     * Range: i128 (-(2^127) to 2^127-1)
+     * Max 18 decimal places.
+     */
+    value: string | number | bigint;
+    /**
+     * Decimal precision (0-18) - only needed when value is raw integer/bigint.
+     * Auto-detected when value is a decimal string like "99.77".
+     */
+    valueDecimals?: number;
+    /** Direct 0-100 score (optional, integer) - takes priority over tag normalization */
+    score?: number;
+    /** Category tag 1 (max 32 UTF-8 bytes) - case-insensitive for ATOM tags */
+    tag1?: string;
+    /** Category tag 2 (max 32 UTF-8 bytes) */
+    tag2?: string;
+    /** Endpoint used (max 250 UTF-8 bytes) */
+    endpoint?: string;
+    /** URI to detailed feedback file (max 250 UTF-8 bytes, optional) */
+    feedbackUri?: string;
+    /**
+     * SEAL v1: Optional hash of the feedback file content (32 bytes).
+     * Used for external file integrity verification.
+     * The on-chain seal_hash is computed from all parameters including this.
+     */
+    feedbackFileHash?: Buffer;
+}
+/**
+ * Parameters for agent search
+ */
+export interface SearchParams {
+    chains?: number[] | 'all';
+    name?: string;
+    description?: string;
+    owners?: Address[];
+    operators?: Address[];
+    mcp?: boolean;
+    a2a?: boolean;
+    ens?: string;
+    did?: string;
+    walletAddress?: Address;
+    supportedTrust?: string[];
+    a2aSkills?: string[];
+    mcpTools?: string[];
+    mcpPrompts?: string[];
+    mcpResources?: string[];
+    active?: boolean;
+    x402support?: boolean;
+}
+/**
+ * Parameters for feedback search
+ */
+export interface SearchFeedbackParams {
+    agents?: AgentId[];
+    tags?: string[];
+    reviewers?: Address[];
+    capabilities?: string[];
+    skills?: string[];
+    tasks?: string[];
+    names?: string[];
+    minScore?: number;
+    maxScore?: number;
+    includeRevoked?: boolean;
+}
+/**
+ * Metadata for multi-chain search results
+ */
+export interface SearchResultMeta {
+    chains: number[];
+    successfulChains: number[];
+    failedChains: number[];
+    totalResults: number;
+    timing: {
+        totalMs: number;
+        averagePerChainMs?: number;
+    };
+}
+//# sourceMappingURL=interfaces.d.ts.map

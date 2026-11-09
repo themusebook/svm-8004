@@ -1,0 +1,1321 @@
+import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+
+const mockFetch = jest.fn() as jest.MockedFunction<typeof fetch>;
+global.fetch = mockFetch;
+
+// Mock compression
+jest.unstable_mockModule('../../src/utils/compression.js', () => ({
+  decompressBase64Value: jest.fn(async (v: string) => v),
+}));
+
+// Mock validation
+jest.unstable_mockModule('../../src/utils/validation.js', () => ({
+  validateNonce: jest.fn(),
+}));
+
+const {
+  IndexerClient,
+  encodeCanonicalFeedbackId,
+  decodeCanonicalFeedbackId,
+  encodeCanonicalResponseId,
+  decodeCanonicalResponseId,
+} = await import('../../src/core/indexer-client.js');
+const { IndexerError, IndexerErrorCode, IndexerUnauthorizedError, IndexerTimeoutError, IndexerRateLimitError, IndexerUnavailableError } = await import('../../src/core/indexer-errors.js');
+
+const createClient = (overrides: Record<string, unknown> = {}) =>
+  new IndexerClient({
+    baseUrl: 'https://test.supabase.co/rest/v1',
+    apiKey: 'test-key',
+    timeout: 1000,
+    retries: 0,
+    ...overrides,
+  });
+
+function mockJsonResponse(data: unknown, status = 200, headers: Record<string, string> = {}) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: status === 200 ? 'OK' : 'Error',
+    headers: new Headers(headers),
+    json: async () => data,
+    text: async () => JSON.stringify(data),
+  } as Response;
+}
+
+describe('IndexerClient', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('constructor', () => {
+    it('should strip trailing slash from baseUrl', () => {
+      const client = new IndexerClient({
+        baseUrl: 'https://test.supabase.co/rest/v1/',
+        apiKey: 'key',
+      });
+      expect(client.getBaseUrl()).toBe('https://test.supabase.co/rest/v1');
+    });
+
+    it('should use default timeout and retries', () => {
+      const client = new IndexerClient({
+        baseUrl: 'https://test.supabase.co/rest/v1',
+        apiKey: 'key',
+      });
+      expect(client).toBeDefined();
+    });
+  });
+
+  describe('error handling', () => {
+    it('should throw IndexerUnauthorizedError on 401', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse({}, 401));
+      await expect(client.getAgent('test')).rejects.toBeInstanceOf(IndexerUnauthorizedError);
+    });
+
+    it('should throw IndexerRateLimitError on 429', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse({}, 429, { 'Retry-After': '30' }));
+      try {
+        await client.getAgent('test');
+      } catch (e) {
+        expect(e).toBeInstanceOf(IndexerRateLimitError);
+        expect((e as IndexerRateLimitError).retryAfter).toBe(30);
+      }
+    });
+
+    it('should throw IndexerError on 500', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse({}, 500));
+      await expect(client.getAgent('test')).rejects.toThrow('Server error');
+    });
+
+    it('should throw on other HTTP errors', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse({}, 400));
+      await expect(client.getAgent('test')).rejects.toThrow();
+    });
+
+    it('should handle timeout (AbortError)', async () => {
+      const client = createClient();
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      mockFetch.mockRejectedValue(err);
+      await expect(client.getAgent('test')).rejects.toBeInstanceOf(IndexerTimeoutError);
+    });
+
+    it('should handle network errors', async () => {
+      const client = createClient();
+      mockFetch.mockRejectedValue(new TypeError('fetch failed'));
+      await expect(client.getAgent('test')).rejects.toBeInstanceOf(IndexerUnavailableError);
+    });
+
+    it('should retry on server errors', async () => {
+      const client = createClient({ retries: 1 });
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse({}, 500))
+        .mockResolvedValueOnce(mockJsonResponse([{ asset: 'test' }]));
+      const result = await client.getAgent('test');
+      expect(result).toEqual({ asset: 'test' });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('isAvailable', () => {
+    it('should return true when /ready reports ready', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse({ status: 'ready' }));
+      expect(await client.isAvailable()).toBe(true);
+    });
+
+    it('should return false when /ready reports starting', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse({ status: 'starting' }, 503));
+      expect(await client.isAvailable()).toBe(false);
+    });
+
+    it('should fallback to legacy REST accessibility when /ready is missing', async () => {
+      const client = createClient();
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse({ error: 'missing' }, 404))
+        .mockResolvedValueOnce(mockJsonResponse([]));
+
+      expect(await client.isAvailable()).toBe(true);
+      expect(mockFetch.mock.calls[0]?.[0]).toBe('https://test.supabase.co/ready');
+      expect(mockFetch.mock.calls[1]?.[0]).toBe('https://test.supabase.co/rest/v1/agents?limit=1');
+    });
+
+    it('should fallback to the next REST endpoint on server failure', async () => {
+      const client = createClient({
+        baseUrl: ['https://primary.example.com/rest/v1', 'https://secondary.example.com/rest/v1'],
+      });
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse({ status: 'starting' }, 503))
+        .mockResolvedValueOnce(mockJsonResponse({ status: 'ready' }));
+
+      expect(await client.isAvailable()).toBe(true);
+      expect(mockFetch.mock.calls[0]?.[0]).toBe('https://primary.example.com/ready');
+      expect(mockFetch.mock.calls[1]?.[0]).toBe('https://secondary.example.com/ready');
+    });
+  });
+
+  describe('getAgent', () => {
+    it('should return agent when found', async () => {
+      const client = createClient();
+      const agent = { asset: 'test', owner: 'owner1' };
+      mockFetch.mockResolvedValue(mockJsonResponse([agent]));
+      const result = await client.getAgent('test');
+      expect(result).toEqual(agent);
+    });
+
+    it('should return null when not found', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      expect(await client.getAgent('test')).toBeNull();
+    });
+  });
+
+  describe('getAgents', () => {
+    it('should return agents with pagination', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([{ asset: 'a' }, { asset: 'b' }]));
+      const result = await client.getAgents({ limit: 10, offset: 0 });
+      expect(result.length).toBe(2);
+    });
+
+    it('should use default order', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getAgents();
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('order=created_at.desc');
+    });
+
+    it('should apply creator/pointer/parent filters', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+
+      await client.getAgents({
+        creator: 'creator1',
+        collectionPointer: 'c1:abc123',
+        parentAsset: 'parent1',
+        parentCreator: 'parentCreator1',
+        colLocked: true,
+        parentLocked: false,
+      });
+
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('creator=eq.creator1');
+      expect(url).toContain('collection_pointer=eq.c1%3Aabc123');
+      expect(url).toContain('parent_asset=eq.parent1');
+      expect(url).toContain('parent_creator=eq.parentCreator1');
+      expect(url).toContain('col_locked=eq.true');
+      expect(url).toContain('parent_locked=eq.false');
+    });
+  });
+
+  describe('getAgentsByOwner', () => {
+    it('should filter by owner', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getAgentsByOwner('owner1');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('owner=eq.owner1');
+    });
+  });
+
+  describe('getAgentsByCollection', () => {
+    it('should filter by collection', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getAgentsByCollection('coll1');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('collection=eq.coll1');
+    });
+  });
+
+  describe('getAgentByWallet', () => {
+    it('should return agent by wallet', async () => {
+      const client = createClient();
+      const agent = { asset: 'a', agent_wallet: 'wallet1' };
+      mockFetch.mockResolvedValue(mockJsonResponse([agent]));
+      const result = await client.getAgentByWallet('wallet1');
+      expect(result?.agent_wallet).toBe('wallet1');
+    });
+
+    it('should return null when not found', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      expect(await client.getAgentByWallet('missing')).toBeNull();
+    });
+  });
+
+  describe('getAgentByAgentId', () => {
+    it('should return agent by agent_id', async () => {
+      const client = createClient();
+      const agent = { agent_id: '42', asset: 'a' };
+      mockFetch.mockResolvedValue(mockJsonResponse([agent]));
+      const result = await client.getAgentByAgentId('42');
+      expect(result?.agent_id).toBe('42');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('agent_id=eq.42');
+    });
+
+    it('should normalize sol-prefixed string ids before querying', async () => {
+      const client = createClient();
+      const agent = { agent_id: '42', asset: 'a' };
+      mockFetch.mockResolvedValue(mockJsonResponse([agent]));
+
+      const result = await client.getAgentByAgentId(' sol:42 ');
+
+      expect(result?.agent_id).toBe('42');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('agent_id=eq.42');
+    });
+
+    it('should return null when not found', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      expect(await client.getAgentByAgentId(999n)).toBeNull();
+    });
+
+    it('should keep getAgentByIndexerId as an alias', async () => {
+      const client = createClient();
+      const agent = { agent_id: '77', asset: 'a' };
+      mockFetch.mockResolvedValue(mockJsonResponse([agent]));
+      const result = await client.getAgentByIndexerId('77');
+      expect(result?.agent_id).toBe('77');
+    });
+  });
+
+  describe('getAgentReputation', () => {
+    it('should return reputation data', async () => {
+      const client = createClient();
+      const rep = { asset: 'a', feedback_count: 10 };
+      mockFetch.mockResolvedValue(mockJsonResponse([rep]));
+      const result = await client.getAgentReputation('a');
+      expect(result?.feedback_count).toBe(10);
+    });
+
+    it('should return null when not found', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      expect(await client.getAgentReputation('missing')).toBeNull();
+    });
+
+    it('should surface /agent_reputation errors instead of inventing reputation fields', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ error: 'forbidden' }, 403));
+
+      await expect(client.getAgentReputation('asset1')).rejects.toThrow(/HTTP 403/i);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect((mockFetch.mock.calls[0][0] as string)).toContain('/agent_reputation?');
+    });
+  });
+
+  describe('getLeaderboard', () => {
+    it('should call the public leaderboard endpoint by default', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getLeaderboard();
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('/leaderboard?');
+      expect(url).not.toContain('/rpc/get_leaderboard');
+    });
+
+    it('should apply collection as a public leaderboard query filter', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getLeaderboard({ collection: 'c1', minTier: 2 });
+      const url = new URL(String(mockFetch.mock.calls[0][0]));
+      expect(url.pathname).toContain('/leaderboard');
+      expect(url.searchParams.get('collection')).toBe('eq.c1');
+      expect(url.searchParams.get('limit')).toBe('50');
+    });
+
+    it('should fall back to the leaderboard RPC when cursorSortKey is requested', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getLeaderboard({ collection: 'c1', minTier: 2, cursorSortKey: '999' });
+      const url = String(mockFetch.mock.calls[0][0]);
+      const [, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+      expect(url).toContain('/rpc/get_leaderboard');
+      expect(JSON.parse(String(init.body))).toEqual({
+        p_collection: 'c1',
+        p_min_tier: 2,
+        p_limit: 50,
+        p_cursor_sort_key: '999',
+      });
+    });
+
+    it('should filter public leaderboard rows client-side when minTier is stricter than the endpoint default', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(
+        mockJsonResponse([
+          { asset: 'a', trust_tier: 2 },
+          { asset: 'b', trust_tier: 3 },
+        ]),
+      );
+
+      const rows = await client.getLeaderboard({ minTier: 3 });
+      expect(rows.map((row) => row.asset)).toEqual(['b']);
+    });
+  });
+
+  describe('getLeaderboardRPC', () => {
+    it('should call RPC endpoint', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getLeaderboardRPC({ collection: 'c1', minTier: 1, limit: 10 });
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('/rpc/get_leaderboard');
+    });
+
+    it('should surface an error when RPC endpoint is not exposed', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ error: 'method not allowed' }, 405));
+
+      await expect(client.getLeaderboardRPC({ collection: 'c1', minTier: 1, limit: 10 })).rejects.toThrow(
+        /HTTP 405/i
+      );
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('getFeedbacks', () => {
+    it('should filter by asset', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getFeedbacks('asset1');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('asset=eq.asset1');
+      expect(url).toContain('order=feedback_id.desc');
+    });
+
+    it('should exclude revoked by default', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getFeedbacks('asset1');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('is_revoked=eq.false');
+    });
+
+    it('should include revoked when requested', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getFeedbacks('asset1', { includeRevoked: true });
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).not.toContain('is_revoked');
+    });
+  });
+
+  describe('getFeedback', () => {
+    it('should filter by asset, client, and index', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([{ id: '1' }]));
+      const result = await client.getFeedback('asset1', 'client1', 5n);
+      expect(result).not.toBeNull();
+    });
+
+    it('should return null when not found', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      expect(await client.getFeedback('a', 'c', 0)).toBeNull();
+    });
+  });
+
+  describe('canonical id helpers', () => {
+    it('should encode/decode feedback ids without sol prefix', () => {
+      const id = encodeCanonicalFeedbackId('asset1', 'client1', 7n);
+      expect(id).toBe('asset1:client1:7');
+      expect(decodeCanonicalFeedbackId(id)).toEqual({
+        asset: 'asset1',
+        client: 'client1',
+        index: '7',
+      });
+    });
+
+    it('should decode legacy sol-prefixed feedback ids', () => {
+      expect(decodeCanonicalFeedbackId('sol:asset1:client1:7')).toEqual({
+        asset: 'asset1',
+        client: 'client1',
+        index: '7',
+      });
+    });
+
+    it('should encode/decode response ids without sol prefix', () => {
+      const id = encodeCanonicalResponseId('asset1', 'client1', 7, 'responder1', 2);
+      expect(id).toBe('asset1:client1:7:responder1:2');
+      expect(decodeCanonicalResponseId(id)).toEqual({
+        asset: 'asset1',
+        client: 'client1',
+        index: '7',
+        responder: 'responder1',
+        sequenceOrSig: '2',
+      });
+    });
+  });
+
+  describe('feedback id reads', () => {
+    it('getFeedbackById should resolve sequential ids via direct feedback_id lookup', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([{
+        id: '123',
+        asset: 'asset1',
+        client_address: 'client1',
+        feedback_index: '7',
+      }]));
+      const result = await client.getFeedbackById('123');
+      expect(result).not.toBeNull();
+      expect(result?.id).toBe('asset1:client1:7');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('feedback_id=eq.123');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('getFeedbackById should resolve canonical input ids via scoped feedback lookup', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([{ id: 'asset1:client1:7' }]));
+      const result = await client.getFeedbackById('asset1:client1:7');
+      expect(result).not.toBeNull();
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('asset=eq.asset1');
+      expect(url).toContain('client_address=eq.client1');
+      expect(url).toContain('feedback_index=eq.7');
+      expect(url).toContain('limit=1');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('getFeedbackById should return null for non-numeric ids', async () => {
+      const client = createClient();
+      expect(await client.getFeedbackById('not-a-number')).toBeNull();
+      expect(mockFetch).toHaveBeenCalledTimes(0);
+    });
+
+    it('getFeedbackResponsesByFeedbackId should resolve asset then query responses for sequential ids', async () => {
+      const client = createClient();
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse([{ asset: 'asset1' }]))
+        .mockResolvedValueOnce(mockJsonResponse([{
+          id: '1',
+          asset: 'asset1',
+          client_address: 'client1',
+          feedback_index: '7',
+          responder: 'responder1',
+          tx_signature: 'sig1',
+        }]));
+      const rows = await client.getFeedbackResponsesByFeedbackId('123', 10);
+      expect(rows[0]?.id).toBe('asset1:client1:7:responder1:sig1');
+      const feedbackLookupUrl = (mockFetch.mock.calls[0][0] as string);
+      expect(feedbackLookupUrl).toContain('/feedbacks?');
+      expect(feedbackLookupUrl).toContain('feedback_id=eq.123');
+      expect(feedbackLookupUrl).toContain('select=asset');
+      expect(feedbackLookupUrl).toContain('limit=2');
+
+      const responsesUrl = (mockFetch.mock.calls[1][0] as string);
+      expect(responsesUrl).toContain('/feedback_responses?');
+      expect(responsesUrl).toContain('asset=eq.asset1');
+      expect(responsesUrl).toContain('feedback_id=eq.123');
+      expect(responsesUrl).toContain('order=response_id.asc');
+      expect(responsesUrl).toContain('limit=10');
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('getFeedbackResponsesByFeedbackId should return [] when feedback lookup misses', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValueOnce(mockJsonResponse([]));
+
+      await expect(client.getFeedbackResponsesByFeedbackId('123', 10)).resolves.toEqual([]);
+      const feedbackLookupUrl = (mockFetch.mock.calls[0][0] as string);
+      expect(feedbackLookupUrl).toContain('/feedbacks?');
+      expect(feedbackLookupUrl).toContain('feedback_id=eq.123');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('getFeedbackResponsesByFeedbackId should fail closed when lookup resolves multiple assets', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValueOnce(mockJsonResponse([{ asset: 'asset1' }, { asset: 'asset2' }]));
+
+      await expect(client.getFeedbackResponsesByFeedbackId('123', 10)).rejects.toMatchObject({
+        name: 'IndexerError',
+        code: IndexerErrorCode.INVALID_RESPONSE,
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('getFeedbackResponsesByFeedbackId should allow duplicate lookup rows for the same asset', async () => {
+      const client = createClient();
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse([{ asset: 'asset1' }, { asset: 'asset1' }]))
+        .mockResolvedValueOnce(mockJsonResponse([]));
+
+      await expect(client.getFeedbackResponsesByFeedbackId('123', 10)).resolves.toEqual([]);
+      const feedbackLookupUrl = (mockFetch.mock.calls[0][0] as string);
+      expect(feedbackLookupUrl).toContain('limit=2');
+      const responsesUrl = (mockFetch.mock.calls[1][0] as string);
+      expect(responsesUrl).toContain('asset=eq.asset1');
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('getFeedbackResponsesByFeedbackId should resolve canonical input ids via scoped response lookup', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValueOnce(mockJsonResponse([]));
+      await expect(client.getFeedbackResponsesByFeedbackId('asset1:client1:7', 10)).resolves.toEqual([]);
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('/feedback_responses?');
+      expect(url).toContain('asset=eq.asset1');
+      expect(url).toContain('client_address=eq.client1');
+      expect(url).toContain('feedback_index=eq.7');
+      expect(url).toContain('order=response_id.asc');
+      expect(url).toContain('limit=10');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('getFeedbacksByClient', () => {
+    it('should filter by client', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getFeedbacksByClient('client1');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('client_address=eq.client1');
+      expect(url).toContain('order=feedback_id.desc');
+    });
+  });
+
+  describe('getFeedbacksByTag', () => {
+    it('should search in both tag1 and tag2', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getFeedbacksByTag('uptime');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('tag1.eq.uptime');
+      expect(url).toContain('tag2.eq.uptime');
+      expect(url).toContain('order=feedback_id.desc');
+    });
+  });
+
+  describe('getFeedbacksByEndpoint', () => {
+    it('should filter by endpoint', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getFeedbacksByEndpoint('https://api.test.com');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('endpoint=eq.https');
+      expect(url).toContain('order=feedback_id.desc');
+    });
+  });
+
+  describe('getAllFeedbacks', () => {
+    it('should use bulk query', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getAllFeedbacks({ limit: 100 });
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('limit=100');
+    });
+  });
+
+  describe('getLastFeedbackIndex', () => {
+    it('should return -1n when no feedbacks', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      const result = await client.getLastFeedbackIndex('asset', 'client');
+      expect(result).toBe(-1n);
+    });
+
+    it('should return BigInt index', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([{ feedback_index: '42' }]));
+      const result = await client.getLastFeedbackIndex('asset', 'client');
+      expect(result).toBe(42n);
+    });
+  });
+
+  describe('getMetadata', () => {
+    it('should return decompressed metadata', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([
+        { asset: 'a', key: 'k1', value: 'base64val' },
+      ]));
+      const result = await client.getMetadata('a');
+      expect(result.length).toBe(1);
+    });
+  });
+
+  describe('getMetadataByKey', () => {
+    it('should return specific metadata entry', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([{ key: 'k1', value: 'v1' }]));
+      const result = await client.getMetadataByKey('a', 'k1');
+      expect(result?.key).toBe('k1');
+    });
+
+    it('should return null when not found', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      expect(await client.getMetadataByKey('a', 'missing')).toBeNull();
+    });
+  });
+
+  describe('getValidations', () => {
+    it('should throw because validation feature is archived', async () => {
+      const client = createClient();
+      await expect(client.getValidations('asset1')).rejects
+        .toThrow('Validation feature is archived (v0.5.0+) and is not exposed by indexers.');
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getValidationsByValidator', () => {
+    it('should throw because validation feature is archived', async () => {
+      const client = createClient();
+      await expect(client.getValidationsByValidator('val1')).rejects
+        .toThrow('Validation feature is archived (v0.5.0+) and is not exposed by indexers.');
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getPendingValidations', () => {
+    it('should throw because validation feature is archived', async () => {
+      const client = createClient();
+      await expect(client.getPendingValidations('val1')).rejects
+        .toThrow('Validation feature is archived (v0.5.0+) and is not exposed by indexers.');
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getValidation', () => {
+    it('should throw because validation feature is archived', async () => {
+      const client = createClient();
+      await expect(client.getValidation('a', 'v', 0)).rejects
+        .toThrow('Validation feature is archived (v0.5.0+) and is not exposed by indexers.');
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('should also throw for bigint nonce', async () => {
+      const client = createClient();
+      await expect(client.getValidation('a', 'v', 5n)).rejects
+        .toThrow('Validation feature is archived (v0.5.0+) and is not exposed by indexers.');
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getGlobalStats', () => {
+    it('should return global stats', async () => {
+      const client = createClient();
+      const stats = { total_agents: 100, total_feedbacks: 500 };
+      mockFetch.mockResolvedValue(mockJsonResponse([stats]));
+      const result = await client.getGlobalStats();
+      expect(result.total_agents).toBe(100);
+    });
+
+    it('should map current global stats without archived validation count', async () => {
+      const client = createClient();
+      const stats = {
+        total_agents: 100,
+        total_collections: 12,
+        total_feedbacks: 500,
+        platinum_agents: 1,
+        gold_agents: 2,
+        avg_quality: 81.5,
+      };
+      mockFetch.mockResolvedValue(mockJsonResponse([stats]));
+
+      const result = await client.getGlobalStats();
+      expect(result).toMatchObject({
+        total_agents: 100,
+        total_collections: 12,
+        total_feedbacks: 500,
+        platinum_agents: 1,
+        gold_agents: 2,
+        avg_quality: 81.5,
+      });
+    });
+
+    it('should return defaults when empty', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      const result = await client.getGlobalStats();
+      expect(result.total_agents).toBe(0);
+    });
+
+    it('should fallback to the next REST endpoint on 503', async () => {
+      const client = createClient({
+        baseUrl: ['https://primary.example.com/rest/v1', 'https://secondary.example.com/rest/v1'],
+      });
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse({ error: 'down' }, 503))
+        .mockResolvedValueOnce(mockJsonResponse([{ total_agents: 7, total_feedbacks: 9, total_collections: 1 }]));
+
+      const result = await client.getGlobalStats();
+      expect(result.total_agents).toBe(7);
+      expect(mockFetch.mock.calls[0]?.[0]).toBe('https://primary.example.com/rest/v1/global_stats');
+      expect(mockFetch.mock.calls[1]?.[0]).toBe('https://secondary.example.com/rest/v1/global_stats');
+    });
+
+    it('should not fallback to the next REST endpoint on client-side 400 errors', async () => {
+      const client = createClient({
+        baseUrl: ['https://primary.example.com/rest/v1', 'https://secondary.example.com/rest/v1'],
+      });
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ error: 'bad request' }, 400));
+
+      await expect(client.getGlobalStats()).rejects.toBeInstanceOf(IndexerError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('collection read compatibility', () => {
+    it('getCollectionPointers should use /collections + collection filter', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([
+        {
+          collection: 'c1:abc',
+          creator: 'creator1',
+          first_seen_asset: 'asset1',
+          first_seen_at: '2026-01-01T00:00:00.000Z',
+          first_seen_slot: '10',
+          first_seen_tx_signature: null,
+          last_seen_at: '2026-01-02T00:00:00.000Z',
+          last_seen_slot: '11',
+          last_seen_tx_signature: null,
+          asset_count: '1',
+        },
+      ]));
+
+      const rows = await client.getCollectionPointers({ collection: 'c1:abc', creator: 'creator1' });
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('/collections?');
+      expect(url).toContain('collection=eq.c1%3Aabc');
+      expect(rows[0]).toMatchObject({ collection: 'c1:abc', col: 'c1:abc', creator: 'creator1' });
+    });
+
+    it('getCollectionPointers should fallback to legacy endpoint on 404', async () => {
+      const client = createClient();
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse({}, 404))
+        .mockResolvedValueOnce(mockJsonResponse([
+          {
+            col: 'c1:legacy',
+            creator: 'legacyCreator',
+            first_seen_asset: 'assetLegacy',
+            first_seen_at: '2026-01-01T00:00:00.000Z',
+            first_seen_slot: '42',
+            first_seen_tx_signature: null,
+            last_seen_at: '2026-01-02T00:00:00.000Z',
+            last_seen_slot: '43',
+            last_seen_tx_signature: null,
+            asset_count: '7',
+          },
+        ]));
+
+      const rows = await client.getCollectionPointers({ col: 'c1:legacy' });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      const firstUrl = (mockFetch.mock.calls[0][0] as string);
+      const secondUrl = (mockFetch.mock.calls[1][0] as string);
+      expect(firstUrl).toContain('/collections?');
+      expect(secondUrl).toContain('/collection_pointers?');
+      expect(secondUrl).toContain('col=eq.c1%3Alegacy');
+      expect(rows[0]).toMatchObject({ collection: 'c1:legacy', col: 'c1:legacy', creator: 'legacyCreator' });
+    });
+
+    it('getCollectionPointers should pass collection_id filter when provided', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([
+        {
+          collection_id: '7',
+          collection: 'c1:abc',
+          creator: 'creator1',
+          first_seen_asset: 'asset1',
+          first_seen_at: '2026-01-01T00:00:00.000Z',
+          first_seen_slot: '10',
+          first_seen_tx_signature: null,
+          last_seen_at: '2026-01-02T00:00:00.000Z',
+          last_seen_slot: '11',
+          last_seen_tx_signature: null,
+          asset_count: '1',
+        },
+      ]));
+
+      const rows = await client.getCollectionPointers({ collectionId: '7' });
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('/collections?');
+      expect(url).toContain('collection_id=eq.7');
+      expect(rows[0]).toMatchObject({ collection_id: '7', col: 'c1:abc', creator: 'creator1' });
+    });
+
+    it('getCollectionPointers should reject non-positive collection_id in response', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([
+        {
+          collection_id: '0',
+          collection: 'c1:abc',
+          creator: 'creator1',
+          first_seen_asset: 'asset1',
+          first_seen_at: '2026-01-01T00:00:00.000Z',
+          first_seen_slot: '10',
+          first_seen_tx_signature: null,
+          last_seen_at: '2026-01-02T00:00:00.000Z',
+          last_seen_slot: '11',
+          last_seen_tx_signature: null,
+          asset_count: '1',
+        },
+      ]));
+
+      await expect(client.getCollectionPointers({ collectionId: '7' })).rejects.toMatchObject({
+        code: IndexerErrorCode.INVALID_RESPONSE,
+      });
+    });
+
+    it('getCollectionPointers should not fallback to legacy endpoint when collectionId is requested', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({}, 404));
+
+      await expect(client.getCollectionPointers({ collectionId: '7' })).rejects.toThrow('HTTP 404');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('/collections?');
+    });
+
+    it('getCollectionPointers should reject empty collection filter', async () => {
+      const client = createClient();
+      await expect(client.getCollectionPointers({ col: '' })).rejects.toThrow(
+        'Collection pointer cannot be empty',
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('getCollectionPointers should reject invalid collection id filter', async () => {
+      const client = createClient();
+      await expect(client.getCollectionPointers({ collectionId: 'abc' })).rejects.toThrow(
+        'collectionId must be an integer',
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('getCollectionPointers should reject unsafe numeric collection id filter', async () => {
+      const client = createClient();
+      await expect(
+        client.getCollectionPointers({ collectionId: Number.MAX_SAFE_INTEGER + 1 }),
+      ).rejects.toThrow('use string/bigint for large values');
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('getCollectionAssetCount should use collection query param', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse({ collection: 'c1:abc', asset_count: 12 }));
+      const count = await client.getCollectionAssetCount('c1:abc', 'creator1');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('/collection_asset_count?');
+      expect(url).toContain('collection=eq.c1%3Aabc');
+      expect(count).toBe(12);
+    });
+
+    it('getCollectionAssetCount should fallback to legacy col param on 400', async () => {
+      const client = createClient();
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse({}, 400))
+        .mockResolvedValueOnce(mockJsonResponse({ col: 'c1:legacy', asset_count: '9' }));
+
+      const count = await client.getCollectionAssetCount('c1:legacy', 'creator1');
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      const secondUrl = (mockFetch.mock.calls[1][0] as string);
+      expect(secondUrl).toContain('/collection_asset_count?');
+      expect(secondUrl).toContain('col=eq.c1%3Alegacy');
+      expect(secondUrl).toContain('creator=eq.creator1');
+      expect(count).toBe(9);
+    });
+
+    it('getCollectionAssets should use collection query param', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([{ asset: 'agent1' }]));
+      const rows = await client.getCollectionAssets('c1:abc', { creator: 'creator1', limit: 5, offset: 2 });
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('/collection_assets?');
+      expect(url).toContain('collection=eq.c1%3Aabc');
+      expect(url).toContain('creator=eq.creator1');
+      expect(rows).toEqual([{ asset: 'agent1' }]);
+    });
+
+    it('getCollectionAssets should fallback to legacy col param on 400', async () => {
+      const client = createClient();
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse({}, 400))
+        .mockResolvedValueOnce(mockJsonResponse([{ asset: 'agentLegacy' }]));
+
+      const rows = await client.getCollectionAssets('c1:legacy', { creator: 'creator1' });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      const secondUrl = (mockFetch.mock.calls[1][0] as string);
+      expect(secondUrl).toContain('/collection_assets?');
+      expect(secondUrl).toContain('col=eq.c1%3Alegacy');
+      expect(secondUrl).toContain('creator=eq.creator1');
+      expect(rows).toEqual([{ asset: 'agentLegacy' }]);
+    });
+
+    it('collection-scoped reads should normalize bare CID to c1 pointer', async () => {
+      const client = createClient();
+      const bareCid = 'bafkreihvfphhye3jom6ewfrlvy4wx7itxmkjc6bjtzrlgfnmfs7dwxc7km';
+      mockFetch.mockResolvedValue(mockJsonResponse({ collection: `c1:${bareCid}`, asset_count: 3 }));
+
+      await client.getCollectionAssetCount(bareCid, 'creator1');
+      const countUrl = (mockFetch.mock.calls[0][0] as string);
+      expect(countUrl).toContain(`collection=eq.c1%3A${bareCid}`);
+    });
+
+    it('collection-scoped reads should infer creator when unique', async () => {
+      const client = createClient();
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse([{ collection: 'c1:abc', creator: 'creator1' }]))
+        .mockResolvedValueOnce(mockJsonResponse({ collection: 'c1:abc', asset_count: 4 }))
+        .mockResolvedValueOnce(mockJsonResponse([{ collection: 'c1:abc', creator: 'creator1' }]))
+        .mockResolvedValueOnce(mockJsonResponse([{ asset: 'agent1' }]));
+
+      const count = await (client as any).getCollectionAssetCount('c1:abc');
+      const rows = await (client as any).getCollectionAssets('c1:abc');
+
+      expect(count).toBe(4);
+      expect(rows).toEqual([{ asset: 'agent1' }]);
+      const countUrl = (mockFetch.mock.calls[1][0] as string);
+      const rowsUrl = (mockFetch.mock.calls[3][0] as string);
+      expect(countUrl).toContain('creator=eq.creator1');
+      expect(rowsUrl).toContain('creator=eq.creator1');
+    });
+
+    it('collection-scoped reads should throw without creator when scope is ambiguous', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(
+        mockJsonResponse([
+          { collection: 'c1:abc', creator: 'creator1' },
+          { collection: 'c1:abc', creator: 'creator2' },
+        ]),
+      );
+
+      await expect((client as any).getCollectionAssetCount('c1:abc')).rejects.toThrow(
+        'multiple creators found for c1:abc',
+      );
+    });
+  });
+
+  describe('getCollectionStats', () => {
+    it('should return collection stats', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([{ collection: 'c1' }]));
+      const result = await client.getCollectionStats('c1');
+      expect(result?.collection).toBe('c1');
+    });
+
+    it('should return null when not found', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      expect(await client.getCollectionStats('missing')).toBeNull();
+    });
+  });
+
+  describe('getAllCollectionStats', () => {
+    it('should return all stats', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([{ collection: 'c1' }]));
+      const result = await client.getAllCollectionStats();
+      expect(result.length).toBe(1);
+    });
+  });
+
+  describe('getCollectionAgents', () => {
+    it('should call RPC function', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      await client.getCollectionAgents('coll1', 20, 0);
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('rpc/get_collection_agents');
+    });
+
+    it('should surface collection agents endpoint errors instead of inventing reputation fields', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ error: 'forbidden' }, 403));
+
+      await expect(client.getCollectionAgents('38', 20, 0)).rejects.toThrow(/HTTP 403/i);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect((mockFetch.mock.calls[0][0] as string)).toContain('/rpc/get_collection_agents');
+    });
+  });
+
+  describe('getFeedbackResponses', () => {
+    it('should return responses', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      const result = await client.getFeedbackResponses('asset1');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('order=response_id.desc');
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('getFeedbackResponsesFor', () => {
+    it('should filter by asset, client, index and normalize canonical response ids', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([{
+        id: '1',
+        asset: 'a',
+        client_address: 'c',
+        feedback_index: '0',
+        responder: 'responder1',
+        tx_signature: 'sig1',
+      }]));
+      const rows = await client.getFeedbackResponsesFor('a', 'c', 0n);
+      expect(rows[0]?.id).toBe('a:c:0:responder1:sig1');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('asset=eq.a');
+      expect(url).toContain('client_address=eq.c');
+      expect(url).toContain('feedback_index=eq.0');
+      expect(url).toContain('order=response_id.asc');
+    });
+  });
+
+  describe('getRevocations', () => {
+    it('should return revocations', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([]));
+      const result = await client.getRevocations('asset1');
+      const url = (mockFetch.mock.calls[0][0] as string);
+      expect(url).toContain('order=revocation_id.asc');
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('getLastFeedbackDigest', () => {
+    it('should return null digest when no feedbacks', async () => {
+      const client = createClient();
+      jest.spyOn(client, 'getReplayData').mockResolvedValue({ events: [], hasMore: false, nextFromCount: 0 });
+      const result = await client.getLastFeedbackDigest('asset');
+      expect(result.digest).toBeNull();
+      expect(result.count).toBe(0);
+    });
+
+    it('should derive digest and count from replay head', async () => {
+      const client = createClient();
+      jest.spyOn(client, 'getReplayData').mockImplementation(async (_asset, _chainType, fromCount) => {
+        if (fromCount === 0) {
+          return {
+            events: [{ asset: 'asset', client: 'client', feedback_index: '0', slot: 1, running_digest: 'd0' }],
+            hasMore: false,
+            nextFromCount: 1,
+          };
+        }
+        if (fromCount === 1) {
+          return {
+            events: [{ asset: 'asset', client: 'client', feedback_index: '1', slot: 2, running_digest: 'd1' }],
+            hasMore: false,
+            nextFromCount: 2,
+          };
+        }
+        return { events: [], hasMore: false, nextFromCount: fromCount };
+      });
+      const result = await client.getLastFeedbackDigest('asset');
+      expect(result).toEqual({ digest: 'd1', count: 2 });
+    });
+  });
+
+  describe('getLastResponseDigest', () => {
+    it('should return null when no responses', async () => {
+      const client = createClient();
+      jest.spyOn(client, 'getReplayData').mockResolvedValue({ events: [], hasMore: false, nextFromCount: 1 });
+      const result = await client.getLastResponseDigest('asset');
+      expect(result.digest).toBeNull();
+      expect(result.count).toBe(0);
+    });
+  });
+
+  describe('getLastRevokeDigest', () => {
+    it('should return null when no revocations', async () => {
+      const client = createClient();
+      jest.spyOn(client, 'getReplayData').mockResolvedValue({ events: [], hasMore: false, nextFromCount: 1 });
+      const result = await client.getLastRevokeDigest('asset');
+      expect(result.digest).toBeNull();
+      expect(result.count).toBe(0);
+    });
+  });
+
+  describe('getFeedbacksAtIndices', () => {
+    it('should return empty map for empty indices', async () => {
+      const client = createClient();
+      const result = await client.getFeedbacksAtIndices('asset', []);
+      expect(result.size).toBe(0);
+    });
+
+    it('should return map with null for missing indices', async () => {
+      const client = createClient();
+      jest.spyOn(client, 'getReplayData').mockResolvedValue({ events: [], hasMore: false, nextFromCount: 0 });
+      const result = await client.getFeedbacksAtIndices('asset', [0, 5, 10]);
+      expect(result.size).toBe(3);
+      expect(result.get(0)).toBeNull();
+    });
+
+    it('should populate found feedbacks from replay data', async () => {
+      const client = createClient();
+      jest.spyOn(client, 'getReplayData').mockImplementation(async (_asset, _chainType, fromCount) => {
+        if (fromCount === 5) {
+          return {
+            events: [{ asset: 'a', client: 'c', feedback_index: '5', slot: 99, running_digest: 'abc' }],
+            hasMore: false,
+            nextFromCount: 6,
+          };
+        }
+        return { events: [], hasMore: false, nextFromCount: fromCount };
+      });
+      const result = await client.getFeedbacksAtIndices('asset', [0, 5]);
+      expect(result.get(5)).not.toBeNull();
+      expect(result.get(0)).toBeNull();
+    });
+  });
+
+  describe('getResponseCount', () => {
+    it('should return count', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([], 200, { 'Content-Range': '0-0/15' }));
+      const result = await client.getResponseCount('asset');
+      expect(result).toBe(15);
+    });
+  });
+
+  describe('getResponsesAtOffsets', () => {
+    it('should return empty map for empty offsets', async () => {
+      const client = createClient();
+      const result = await client.getResponsesAtOffsets('asset', []);
+      expect(result.size).toBe(0);
+    });
+
+    it('should resolve offsets through replay counts', async () => {
+      const client = createClient();
+      const replaySpy = jest.spyOn(client, 'getReplayData').mockResolvedValue({
+        events: [],
+        hasMore: false,
+        nextFromCount: 0,
+      });
+      const result = await client.getResponsesAtOffsets('asset', [0, 1]);
+      expect(replaySpy).toHaveBeenNthCalledWith(1, 'asset', 'response', 1, 2, 1);
+      expect(replaySpy).toHaveBeenNthCalledWith(2, 'asset', 'response', 2, 3, 1);
+      expect(result.size).toBe(2);
+    });
+
+  });
+
+  describe('getRevocationsAtCounts', () => {
+    it('should return empty map for empty counts', async () => {
+      const client = createClient();
+      const result = await client.getRevocationsAtCounts('asset', []);
+      expect(result.size).toBe(0);
+    });
+
+    it('should resolve revoke counts through replay data', async () => {
+      const client = createClient();
+      const replaySpy = jest.spyOn(client, 'getReplayData').mockResolvedValue({
+        events: [],
+        hasMore: false,
+        nextFromCount: 0,
+      });
+
+      const result = await client.getRevocationsAtCounts('asset', [1, 3]);
+      expect(replaySpy).toHaveBeenNthCalledWith(1, 'asset', 'revoke', 1, 2, 1);
+      expect(replaySpy).toHaveBeenNthCalledWith(2, 'asset', 'revoke', 3, 4, 1);
+      expect(result.get(1)).toBeNull();
+      expect(result.get(3)).toBeNull();
+    });
+  });
+
+  describe('getCount', () => {
+    it('should parse Content-Range header', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse([], 200, { 'Content-Range': '0-0/42' }));
+      const count = await client.getCount('feedbacks', { asset: 'eq.test' });
+      expect(count).toBe(42);
+    });
+
+    it('should fallback to array length', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => [1, 2, 3],
+      } as Response);
+      const count = await client.getCount('feedbacks', {});
+      expect(count).toBe(3);
+    });
+  });
+
+  describe('getReplayData', () => {
+    it('should fetch replay data envelope', async () => {
+      const client = createClient();
+      const events = [{ asset: 'a', client: 'c', feedback_index: '0', slot: 100 }];
+      mockFetch.mockResolvedValue(mockJsonResponse({
+        events,
+        hasMore: false,
+        nextFromCount: 1,
+      }));
+      const result = await client.getReplayData('asset', 'feedback');
+      expect(result.events.length).toBe(1);
+      expect(result.hasMore).toBe(false);
+      expect(result.nextFromCount).toBe(1);
+    });
+
+    it('should accept string revoke_count values from REST replay payload', async () => {
+      const client = createClient();
+      const events = [
+        {
+          asset: 'a',
+          client: 'c',
+          feedback_index: '0',
+          slot: 100,
+          revoke_count: '1',
+        },
+      ];
+      mockFetch.mockResolvedValue(mockJsonResponse({
+        events,
+        hasMore: false,
+        nextFromCount: 2,
+      }));
+      const result = await client.getReplayData('asset', 'revoke');
+      expect(result.events[0]?.revoke_count).toBe('1');
+      expect(result.nextFromCount).toBe(2);
+    });
+
+    it('should support legacy array replay payload', async () => {
+      const client = createClient();
+      const events = [{ asset: 'a', client: 'c', feedback_index: '0', slot: 100 }];
+      mockFetch.mockResolvedValue(mockJsonResponse(events));
+      const result = await client.getReplayData('asset', 'feedback');
+      expect(result.events).toEqual(events);
+      expect(result.nextFromCount).toBe(1);
+    });
+
+    it('should reject unsafe replay counters instead of clamping them', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse({
+        events: [],
+        hasMore: false,
+        nextFromCount: '9007199254740993',
+      }));
+
+      await expect(client.getReplayData('asset', 'feedback')).rejects.toThrow(
+        'nextFromCount exceeds JS safe integer range',
+      );
+    });
+  });
+
+  describe('getLatestCheckpoints', () => {
+    it('should fetch checkpoint set', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse({ feedback: null, response: null, revoke: null }));
+      const result = await client.getLatestCheckpoints('asset');
+      expect(result.feedback).toBeNull();
+    });
+  });
+
+  describe('triggerReplay', () => {
+    it('should trigger replay', async () => {
+      const client = createClient();
+      mockFetch.mockResolvedValue(mockJsonResponse({ valid: true }));
+      const result = await client.triggerReplay('asset');
+      expect(result.valid).toBe(true);
+    });
+  });
+});

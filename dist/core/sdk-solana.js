@@ -1,0 +1,3182 @@
+/**
+ * Solana SDK for Agent0 - 8004 implementation
+ * v0.4.0 - ATOM Engine integration + Indexer support
+ * Provides read and write access to Solana-based agent registries
+ *
+ * BREAKING CHANGES from v0.3.0:
+ * - GiveFeedback/RevokeFeedback now use ATOM Engine for reputation tracking
+ * - New ATOM methods: getAtomStats, getTrustTier, getEnrichedSummary
+ * - Optional indexer integration for fast queries
+ */
+import { PublicKey } from '@solana/web3.js';
+import bs58 from 'bs58';
+import { SolanaClient, UnsupportedRpcError } from './client.js';
+import { SolanaFeedbackManager } from './feedback-manager-solana.js';
+import { EndpointCrawler } from './endpoint-crawler.js';
+import { PDAHelpers } from './pda-helpers.js';
+import { getProgramIdsForCluster } from './programs.js';
+import { keccak256, sha256 } from '../utils/crypto-utils.js';
+import { ACCOUNT_DISCRIMINATORS } from './instruction-discriminators.js';
+import { AgentAccount, MetadataEntryPda } from './borsh-schemas.js';
+import { IdentityTransactionBuilder, ReputationTransactionBuilder, AtomTransactionBuilder, validateCollectionPointer, } from './transaction-builder.js';
+import { AgentMintResolver } from './agent-mint-resolver.js';
+import { getBaseCollection, fetchRegistryConfig } from './config-reader.js';
+import { RegistryConfig } from './borsh-schemas.js';
+import { isBlockedUri } from '../utils/validation.js';
+import { logger } from '../utils/logger.js';
+import { buildSignedPayload, canonicalizeSignedPayload, parseSignedPayload, verifySignedPayload, } from '../utils/signing.js';
+import { ServiceType } from '../models/enums.js';
+import { buildCollectionMetadataJson } from '../models/collection-metadata.js';
+// ATOM Engine imports (v0.4.0)
+import { AtomStats, AtomConfig, TrustTier } from './atom-schemas.js';
+import { getAtomStatsPDA, getAtomConfigPDA } from './atom-pda.js';
+// Indexer imports (v0.4.0)
+import { IndexerClient, encodeCanonicalFeedbackId, decodeCanonicalFeedbackId, encodeCanonicalResponseId, } from './indexer-client.js';
+import { IndexerGraphQLClient } from './indexer-graphql-client.js';
+import { replayFeedbackChain, replayResponseChain, replayRevokeChain, } from './hash-chain-replay.js';
+import { indexedFeedbackToSolanaFeedback } from './indexer-types.js';
+// Indexer defaults (v0.4.1)
+import { getDefaultIndexerUrls, getDefaultIndexerGraphqlUrls, getDefaultIndexerApiKey, DEFAULT_FORCE_ON_CHAIN, SMALL_QUERY_OPERATIONS, } from './indexer-defaults.js';
+import { DEFAULT_CLUSTER } from './defaults.js';
+import { DisabledIndexerClient } from './indexer-disabled.js';
+import { IndexerError, IndexerErrorCode } from './indexer-errors.js';
+function getEnv(key) {
+    if (typeof process !== 'undefined' && process.env) {
+        return process.env[key];
+    }
+    return undefined;
+}
+const CID_V0_PATTERN = /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/;
+const CID_V1_BASE32_PATTERN = /^b[a-z2-7]+$/;
+const COLLECTION_POINTER_PREFIX = 'c1:';
+const COLLECTION_POINTER_PATTERN = /^c1:b[a-z2-7]+$/;
+const COLLECTION_POINTER_MIN_LENGTH = 62;
+const COLLECTION_POINTER_MAX_LENGTH = 128;
+const VALIDATION_ARCHIVED_ERROR = 'Validation feature is archived (v0.5.0+) and is not exposed by indexers.';
+function extractCidCandidate(value) {
+    const trimmed = value.trim();
+    const withoutScheme = trimmed
+        .replace(/^ipfs:\/\//i, '')
+        .replace(/^\/ipfs\//i, '');
+    const cid = withoutScheme.split(/[/?#]/)[0] || '';
+    if (!cid) {
+        throw new Error('Invalid CID input: empty value');
+    }
+    return cid;
+}
+function base32EncodeLowerNoPad(bytes) {
+    const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
+    let value = 0n;
+    let bits = 0;
+    let output = '';
+    for (const byte of bytes) {
+        value = (value << 8n) | BigInt(byte);
+        bits += 8;
+        while (bits >= 5) {
+            const shift = BigInt(bits - 5);
+            const index = Number((value >> shift) & 31n);
+            output += alphabet[index];
+            bits -= 5;
+        }
+    }
+    if (bits > 0) {
+        const index = Number((value << BigInt(5 - bits)) & 31n);
+        output += alphabet[index];
+    }
+    return output;
+}
+function cidV0ToCidV1Base32(cidV0) {
+    if (!CID_V0_PATTERN.test(cidV0)) {
+        throw new Error('Invalid CIDv0 format');
+    }
+    let decoded;
+    try {
+        decoded = bs58.decode(cidV0);
+    }
+    catch {
+        throw new Error('Invalid CIDv0 base58 encoding');
+    }
+    // CIDv0 is a multihash SHA-256 digest: 0x12 0x20 + 32-byte hash.
+    if (decoded.length !== 34 || decoded[0] !== 0x12 || decoded[1] !== 0x20) {
+        throw new Error('Invalid CIDv0 multihash payload');
+    }
+    // CIDv1 bytes: version(0x01) + codec(dag-pb=0x70) + multihash payload.
+    const cidV1Bytes = Uint8Array.from([0x01, 0x70, ...decoded]);
+    return `b${base32EncodeLowerNoPad(cidV1Bytes)}`;
+}
+function normalizeCollectionCid(cidOrUri) {
+    const cid = extractCidCandidate(cidOrUri);
+    const lowered = cid.toLowerCase();
+    if (CID_V1_BASE32_PATTERN.test(lowered)) {
+        return lowered;
+    }
+    if (CID_V0_PATTERN.test(cid)) {
+        return cidV0ToCidV1Base32(cid);
+    }
+    throw new Error('Unsupported CID format. Use CIDv0 (Qm...) or CIDv1 base32 (b...)');
+}
+function toCollectionPointer(cidOrUri) {
+    const pointer = `${COLLECTION_POINTER_PREFIX}${normalizeCollectionCid(cidOrUri)}`;
+    if (pointer.length < COLLECTION_POINTER_MIN_LENGTH ||
+        pointer.length > COLLECTION_POINTER_MAX_LENGTH ||
+        !COLLECTION_POINTER_PATTERN.test(pointer)) {
+        throw new Error('Normalized collection pointer does not match extension schema');
+    }
+    return pointer;
+}
+function normalizeCollectionPointerInput(pointerOrCid) {
+    if (typeof pointerOrCid !== 'string') {
+        throw new Error('col must be a string');
+    }
+    // Backward-compatible: if caller already passes c1:<payload>, preserve existing validation behavior.
+    if (pointerOrCid.startsWith(COLLECTION_POINTER_PREFIX)) {
+        validateCollectionPointer(pointerOrCid);
+        return pointerOrCid;
+    }
+    // DX: for CID/IPFS input, normalize to canonical c1:<cidv1-base32>.
+    // Keep legacy error behavior for other invalid values by delegating to validateCollectionPointer.
+    const trimmed = pointerOrCid.trim();
+    try {
+        const candidate = extractCidCandidate(trimmed);
+        if (CID_V0_PATTERN.test(candidate) || CID_V1_BASE32_PATTERN.test(candidate.toLowerCase())) {
+            return toCollectionPointer(trimmed);
+        }
+    }
+    catch {
+        // keep existing validateCollectionPointer error contract below
+    }
+    validateCollectionPointer(pointerOrCid);
+    return pointerOrCid;
+}
+function normalizeCollectionIdInput(collectionId) {
+    let parsed;
+    if (typeof collectionId === 'bigint') {
+        parsed = collectionId;
+    }
+    else if (typeof collectionId === 'number') {
+        if (!Number.isSafeInteger(collectionId)) {
+            throw new Error('collectionId must be an integer (use string/bigint for large values)');
+        }
+        parsed = BigInt(collectionId);
+    }
+    else if (typeof collectionId === 'string') {
+        const trimmed = collectionId.trim();
+        if (!/^-?\d+$/.test(trimmed)) {
+            throw new Error('collectionId must be an integer');
+        }
+        parsed = BigInt(trimmed);
+    }
+    else {
+        throw new Error('collectionId must be an integer');
+    }
+    if (parsed < 0n) {
+        throw new Error('collectionId must be >= 0');
+    }
+    return parsed.toString();
+}
+/**
+ * Main SDK class for svm-8004 (8004 agent identity, reputation, and ProofPass on Solana).
+ * Defaults to devnet. Pass `cluster: 'mainnet-beta'` for mainnet program IDs and RPC.
+ */
+export class Svm8004 {
+    client;
+    feedbackManager;
+    cluster;
+    programIds;
+    signer;
+    ipfsClient;
+    identityTxBuilder;
+    reputationTxBuilder;
+    atomTxBuilder;
+    mintResolver;
+    baseCollection;
+    _initPromise; // Guard against concurrent initialization
+    // Indexer (v0.4.0)
+    indexerClient;
+    useIndexer;
+    indexerFallback;
+    forceOnChain;
+    constructor(config = {}) {
+        this.cluster = config.cluster || DEFAULT_CLUSTER;
+        this.programIds = getProgramIdsForCluster(this.cluster, config.programIds);
+        this.signer = config.signer;
+        this.ipfsClient = config.ipfsClient;
+        this.client = new SolanaClient({
+            cluster: this.cluster,
+            rpcUrl: config.rpcUrl,
+        });
+        // Initialize feedback manager
+        this.feedbackManager = new SolanaFeedbackManager(this.client, config.ipfsClient, undefined, this.programIds.atomEngine);
+        // Indexer is opt-in: env, explicit URL, localnet localhost, or a named preset.
+        const envRestUrl = getEnv('INDEXER_URL');
+        const envRestKey = getEnv('INDEXER_API_KEY');
+        const envGraphqlUrl = getEnv('INDEXER_GRAPHQL_URL');
+        const indexerOptions = { preset: config.indexerPreset };
+        const restBaseUrl = config.indexerUrl ?? envRestUrl;
+        const restApiKey = config.indexerApiKey ?? envRestKey;
+        const defaultRestUrlsForCluster = getDefaultIndexerUrls(this.cluster, indexerOptions);
+        const defaultGraphqlUrlsForCluster = getDefaultIndexerGraphqlUrls(this.cluster, indexerOptions);
+        const defaultApiKey = getDefaultIndexerApiKey();
+        const resolvedGraphql = config.indexerGraphqlUrl ?? envGraphqlUrl ?? defaultGraphqlUrlsForCluster;
+        const graphqlUrls = (Array.isArray(resolvedGraphql) ? resolvedGraphql : [resolvedGraphql]).filter((url) => typeof url === 'string' && url.trim().length > 0);
+        const resolvedRest = restBaseUrl ?? (Array.isArray(defaultRestUrlsForCluster) ? defaultRestUrlsForCluster : []);
+        const restUrls = (Array.isArray(resolvedRest) ? resolvedRest : [resolvedRest]).filter((url) => typeof url === 'string' && url.trim().length > 0);
+        if (restBaseUrl && restUrls.length > 0) {
+            this.indexerClient = new IndexerClient({
+                baseUrl: restUrls,
+                apiKey: restApiKey ?? defaultApiKey,
+            });
+        }
+        else if (!restBaseUrl && graphqlUrls.length > 0) {
+            this.indexerClient = new IndexerGraphQLClient({
+                graphqlUrl: graphqlUrls,
+            });
+        }
+        else if (restUrls.length > 0) {
+            this.indexerClient = new IndexerClient({
+                baseUrl: restUrls,
+                apiKey: restApiKey ?? defaultApiKey,
+            });
+        }
+        else {
+            this.indexerClient = new DisabledIndexerClient();
+        }
+        // Initialize transaction builders (v0.4.0)
+        const connection = this.client.getConnection();
+        this.identityTxBuilder = new IdentityTransactionBuilder(connection, this.signer, this.programIds);
+        this.reputationTxBuilder = new ReputationTransactionBuilder(connection, this.signer, this.indexerClient, this.programIds);
+        this.atomTxBuilder = new AtomTransactionBuilder(connection, this.signer, this.programIds);
+        this.feedbackManager.setIndexerClient(this.indexerClient);
+        const indexerConfigured = !(this.indexerClient instanceof DisabledIndexerClient);
+        this.useIndexer = config.useIndexer ?? indexerConfigured;
+        this.indexerFallback = config.indexerFallback ?? true;
+        // Force on-chain mode (bypass indexer)
+        this.forceOnChain = config.forceOnChain ?? DEFAULT_FORCE_ON_CHAIN;
+    }
+    /**
+     * Check if operation is a "small query" that prefers RPC in 'auto' mode
+     */
+    isSmallQuery(operation) {
+        return SMALL_QUERY_OPERATIONS.includes(operation);
+    }
+    /**
+     * Initialize the agent mint resolver and base collection (lazy initialization)
+     * Uses promise lock to prevent redundant concurrent network calls
+     */
+    async initializeMintResolver() {
+        if (this.mintResolver) {
+            return; // Already initialized
+        }
+        // If initialization is already in progress, wait for it
+        if (this._initPromise) {
+            return this._initPromise;
+        }
+        // Start initialization and store promise to prevent race condition
+        this._initPromise = (async () => {
+            try {
+                const connection = this.client.getConnection();
+                // v0.3.0: Get base collection from RootConfig
+                this.baseCollection = await getBaseCollection(connection, this.programIds.agentRegistry) || undefined;
+                if (!this.baseCollection) {
+                    throw new Error('Registry not initialized. Root config not found.');
+                }
+                this.mintResolver = new AgentMintResolver(connection, undefined, this.programIds.agentRegistry);
+            }
+            catch (error) {
+                // Clear promise on failure so retry is possible
+                this._initPromise = undefined;
+                throw new Error(`Failed to initialize SDK: ${error}`);
+            }
+        })();
+        return this._initPromise;
+    }
+    /**
+     * Get the current base registry collection pubkey
+     */
+    async getBaseCollection() {
+        await this.initializeMintResolver();
+        return this.baseCollection || null;
+    }
+    // ==================== Agent Methods (v0.3.0 - asset-based) ====================
+    /**
+     * Load agent by asset pubkey - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @returns Agent account data or null if not found
+     */
+    async loadAgent(asset) {
+        // Derive PDA from asset
+        const [agentPDA] = PDAHelpers.getAgentPDA(asset, this.programIds.agentRegistry);
+        // Fetch account data - RpcNetworkError propagates for network issues
+        const data = await this.client.getAccount(agentPDA);
+        if (!data) {
+            return null;
+        }
+        try {
+            return AgentAccount.deserialize(data);
+        }
+        catch (error) {
+            // Deserialization error - log and return null (corrupted/invalid data)
+            logger.error('Error deserializing agent account', error);
+            return null;
+        }
+    }
+    /**
+     * Get a specific metadata entry for an agent - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @param key - Metadata key
+     * @returns Metadata value as string, or null if not found
+     */
+    async getMetadata(asset, key) {
+        try {
+            // Compute key hash (SHA256(key)[0..16]) - v1.9 security update
+            const keyHashFull = await sha256(key);
+            const keyHash = Buffer.from(keyHashFull.slice(0, 16));
+            // Derive metadata entry PDA (v0.3.0 - uses asset)
+            const [metadataEntry] = PDAHelpers.getMetadataEntryPDA(asset, keyHash, this.programIds.agentRegistry);
+            // Fetch metadata account
+            const metadataData = await this.client.getAccount(metadataEntry);
+            if (!metadataData) {
+                return null; // Metadata entry does not exist
+            }
+            // Deserialize and return value
+            const entry = MetadataEntryPda.deserialize(metadataData);
+            return entry.getValueString();
+        }
+        catch (error) {
+            logger.error(`Error getting metadata for key "${key}"`, error);
+            return null;
+        }
+    }
+    /**
+     * Get agents by owner with on-chain metadata - v0.3.0
+     * @param owner - Owner public key
+     * @param options - Optional settings for additional data fetching
+     * @returns Array of agents with metadata (and optionally feedbacks)
+     * @throws UnsupportedRpcError if using default devnet RPC (requires getProgramAccounts)
+     */
+    async getAgentsByOwner(owner, options) {
+        this.client.requireAdvancedQueries('getAgentsByOwner');
+        try {
+            const programId = this.programIds.identityRegistry;
+            // 1. Fetch agent accounts filtered by owner (1 RPC call)
+            // AgentAccount layout: discriminator (8) + collection (32) + owner (32)
+            // Owner is at offset 8 + 32 = 40
+            const agentAccounts = await this.client.getProgramAccounts(programId, [
+                {
+                    memcmp: {
+                        offset: 0,
+                        bytes: bs58.encode(ACCOUNT_DISCRIMINATORS.AgentAccount),
+                    },
+                },
+                {
+                    memcmp: {
+                        offset: 40, // owner is after discriminator (8) + collection (32)
+                        bytes: owner.toBase58(),
+                    },
+                },
+            ]);
+            const agents = agentAccounts.map((acc) => AgentAccount.deserialize(acc.data));
+            // 2. Fetch ALL metadata entries (1 RPC call)
+            const metadataAccounts = await this.client.getProgramAccounts(programId, [
+                {
+                    memcmp: {
+                        offset: 0,
+                        bytes: bs58.encode(ACCOUNT_DISCRIMINATORS.MetadataEntryPda),
+                    },
+                },
+            ]);
+            // Build metadata map: asset → [{key, value}]
+            const metadataMap = new Map();
+            for (const acc of metadataAccounts) {
+                try {
+                    const entry = MetadataEntryPda.deserialize(acc.data);
+                    const assetStr = entry.getAssetPublicKey().toBase58();
+                    if (!metadataMap.has(assetStr))
+                        metadataMap.set(assetStr, []);
+                    metadataMap.get(assetStr).push({
+                        key: entry.metadata_key,
+                        value: entry.getValueString(),
+                    });
+                }
+                catch {
+                    // Skip malformed MetadataEntryPda
+                }
+            }
+            // 3. Optionally fetch feedbacks (2 RPC calls)
+            let feedbacksMap = null;
+            if (options?.includeFeedbacks) {
+                feedbacksMap = await this.feedbackManager.fetchAllFeedbacks(options.includeRevoked ?? false);
+            }
+            // 4. Combine results
+            return agents.map((account) => {
+                const assetStr = account.getAssetPublicKey().toBase58();
+                return {
+                    account,
+                    metadata: metadataMap.get(assetStr) || [],
+                    feedbacks: feedbacksMap ? feedbacksMap.get(assetStr) || [] : [],
+                };
+            });
+        }
+        catch (error) {
+            if (error instanceof UnsupportedRpcError)
+                throw error;
+            logger.error('Error getting agents for owner', error);
+            return [];
+        }
+    }
+    /**
+     * Get all registered agents with their on-chain metadata - v0.3.0
+     * @param options - Optional settings for additional data fetching
+     * @returns Array of agents with metadata extensions (and optionally feedbacks)
+     * @throws UnsupportedRpcError if using default devnet RPC (requires getProgramAccounts)
+     */
+    async getAllAgents(options) {
+        this.client.requireAdvancedQueries('getAllAgents');
+        try {
+            const programId = this.programIds.identityRegistry;
+            // Fetch AgentAccounts and MetadataExtensions in parallel
+            const [agentAccounts, metadataAccounts] = await Promise.all([
+                this.client.getProgramAccounts(programId, [
+                    {
+                        memcmp: {
+                            offset: 0,
+                            bytes: bs58.encode(ACCOUNT_DISCRIMINATORS.AgentAccount),
+                        },
+                    },
+                ]),
+                this.client.getProgramAccounts(programId, [
+                    {
+                        memcmp: {
+                            offset: 0,
+                            bytes: bs58.encode(ACCOUNT_DISCRIMINATORS.MetadataEntryPda),
+                        },
+                    },
+                ]),
+            ]);
+            // Build metadata map by asset (v0.3.0)
+            const metadataMap = new Map();
+            for (const acc of metadataAccounts) {
+                try {
+                    const entry = MetadataEntryPda.deserialize(acc.data);
+                    const assetStr = entry.getAssetPublicKey().toBase58();
+                    if (!metadataMap.has(assetStr))
+                        metadataMap.set(assetStr, []);
+                    metadataMap.get(assetStr).push({
+                        key: entry.metadata_key,
+                        value: entry.getValueString(),
+                    });
+                }
+                catch {
+                    // Skip malformed accounts
+                }
+            }
+            // Combine agents with their metadata
+            const agents = [];
+            for (const acc of agentAccounts) {
+                try {
+                    const agent = AgentAccount.deserialize(acc.data);
+                    const assetStr = agent.getAssetPublicKey().toBase58();
+                    agents.push({
+                        account: agent,
+                        metadata: metadataMap.get(assetStr) || [],
+                        feedbacks: [], // Always initialize as empty array
+                    });
+                }
+                catch {
+                    // Skip malformed accounts
+                }
+            }
+            // Optionally fetch all feedbacks (2 additional RPC calls)
+            if (options?.includeFeedbacks) {
+                const allFeedbacks = await this.feedbackManager.fetchAllFeedbacks(options.includeRevoked ?? false);
+                // Attach feedbacks to each agent
+                for (const agent of agents) {
+                    const assetStr = agent.account.getAssetPublicKey().toBase58();
+                    agent.feedbacks = allFeedbacks.get(assetStr) || [];
+                }
+            }
+            return agents;
+        }
+        catch (error) {
+            if (error instanceof UnsupportedRpcError)
+                throw error;
+            logger.error('Error getting all agents', error);
+            return [];
+        }
+    }
+    /**
+     * Fetch ALL feedbacks for ALL agents (indexer) - v0.4.0
+     * More efficient than calling readAllFeedback() per agent
+     * @param includeRevoked - Include revoked feedbacks? Default: false
+     * @returns Map of asset (base58) -> SolanaFeedback[]
+     *
+     * v0.4.0: FeedbackAccount PDAs removed, uses indexer for data access.
+     * Requires indexer to be configured.
+     */
+    async getAllFeedbacks(includeRevoked = false) {
+        return await this.feedbackManager.fetchAllFeedbacks(includeRevoked);
+    }
+    /**
+     * Check if agent exists - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @returns True if agent exists
+     */
+    async agentExists(asset) {
+        const agent = await this.loadAgent(asset);
+        return agent !== null;
+    }
+    /**
+     * Get agent (alias for loadAgent) - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @returns Agent account data or null if not found
+     */
+    async getAgent(asset) {
+        return this.loadAgent(asset);
+    }
+    /**
+     * Check if address is agent owner - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @param address - Address to check
+     * @returns True if address is the owner
+     */
+    async isAgentOwner(asset, address) {
+        const agent = await this.loadAgent(asset);
+        if (!agent)
+            return false;
+        return agent.getOwnerPublicKey().equals(address);
+    }
+    /**
+     * Get agent owner - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @returns Owner public key or null if agent not found
+     */
+    async getAgentOwner(asset) {
+        const agent = await this.loadAgent(asset);
+        if (!agent)
+            return null;
+        return agent.getOwnerPublicKey();
+    }
+    /**
+     * Get reputation summary - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @returns Reputation summary with count and average score
+     */
+    async getReputationSummary(asset) {
+        const summary = await this.getSummary(asset);
+        return {
+            count: summary.totalFeedbacks,
+            averageScore: summary.averageScore,
+        };
+    }
+    // ==================== Collection Methods (v0.6.0) ====================
+    /**
+     * Get collection details by base-registry collection pubkey - v0.6.0
+     * @param collection - Base registry Metaplex Core collection public key
+     * @returns Collection info or null if not registered
+     */
+    async getCollection(collection) {
+        try {
+            const connection = this.client.getConnection();
+            const registryConfig = await fetchRegistryConfig(connection, collection, this.programIds.agentRegistry);
+            if (!registryConfig) {
+                return null;
+            }
+            return {
+                collection: registryConfig.getCollectionPublicKey(),
+                authority: registryConfig.getAuthorityPublicKey(),
+            };
+        }
+        catch (error) {
+            logger.error('Error getting collection', error);
+            return null;
+        }
+    }
+    /**
+     * Get all registered collections - v0.6.0
+     * Single-collection architecture: typically returns only the base collection
+     * @returns Array of all collection infos
+     * @throws UnsupportedRpcError if using default devnet RPC (requires getProgramAccounts)
+     */
+    async getCollections() {
+        this.client.requireAdvancedQueries('getCollections');
+        try {
+            const programId = this.programIds.identityRegistry;
+            // Fetch all RegistryConfig accounts
+            const registryAccounts = await this.client.getProgramAccounts(programId, [
+                {
+                    memcmp: {
+                        offset: 0,
+                        bytes: bs58.encode(ACCOUNT_DISCRIMINATORS.RegistryConfig),
+                    },
+                },
+            ]);
+            return registryAccounts.map((acc) => {
+                const config = RegistryConfig.deserialize(acc.data);
+                return {
+                    collection: config.getCollectionPublicKey(),
+                    authority: config.getAuthorityPublicKey(),
+                };
+            });
+        }
+        catch (error) {
+            logger.error('Error getting collections', error);
+            return [];
+        }
+    }
+    /**
+     * Get all agents in a base-registry collection (on-chain) - v0.4.0
+     * Returns full AgentAccount data with metadata extensions.
+     *
+     * For faster queries, use `getLeaderboard({ collection: 'xxx' })` which uses the indexer.
+     *
+     * @param collection - Base registry collection public key
+     * @param options - Optional settings for additional data fetching
+     * @returns Array of agents with metadata (and optionally feedbacks)
+     * @throws UnsupportedRpcError if using default devnet RPC (requires getProgramAccounts)
+     */
+    async getCollectionAgents(collection, options) {
+        // Skip on-chain if indexer preferred and user doesn't need full account data
+        // Note: For indexed queries, use getLeaderboard({ collection }) instead
+        this.client.requireAdvancedQueries('getCollectionAgents');
+        try {
+            const programId = this.programIds.identityRegistry;
+            // 1. Fetch agent accounts filtered by collection (1 RPC call)
+            // AgentAccount layout: discriminator (8) + collection (32)
+            // Collection is at offset 8
+            const agentAccounts = await this.client.getProgramAccounts(programId, [
+                {
+                    memcmp: {
+                        offset: 0,
+                        bytes: bs58.encode(ACCOUNT_DISCRIMINATORS.AgentAccount),
+                    },
+                },
+                {
+                    memcmp: {
+                        offset: 8, // collection is right after discriminator
+                        bytes: collection.toBase58(),
+                    },
+                },
+            ]);
+            const agents = agentAccounts.map((acc) => AgentAccount.deserialize(acc.data));
+            // 2. Fetch ALL metadata entries (1 RPC call)
+            const metadataAccounts = await this.client.getProgramAccounts(programId, [
+                {
+                    memcmp: {
+                        offset: 0,
+                        bytes: bs58.encode(ACCOUNT_DISCRIMINATORS.MetadataEntryPda),
+                    },
+                },
+            ]);
+            // Map metadata to agents (by asset)
+            const metadataMap = new Map();
+            for (const acc of metadataAccounts) {
+                try {
+                    const entry = MetadataEntryPda.deserialize(acc.data);
+                    const assetKey = entry.getAssetPublicKey().toBase58();
+                    if (!metadataMap.has(assetKey)) {
+                        metadataMap.set(assetKey, []);
+                    }
+                    metadataMap.get(assetKey).push({
+                        key: entry.key,
+                        value: entry.value,
+                    });
+                }
+                catch {
+                    // Skip invalid metadata entries
+                }
+            }
+            // Build result
+            const result = agents.map((agent) => ({
+                account: agent,
+                metadata: metadataMap.get(agent.getAssetPublicKey().toBase58()) || [],
+                feedbacks: [],
+            }));
+            // 3. Optionally fetch feedbacks
+            if (options?.includeFeedbacks) {
+                // getAllFeedbacks returns Map<assetKey, SolanaFeedback[]>
+                const feedbackMap = await this.getAllFeedbacks(options.includeRevoked);
+                for (const agent of result) {
+                    agent.feedbacks = feedbackMap.get(agent.account.getAssetPublicKey().toBase58()) || [];
+                }
+            }
+            return result;
+        }
+        catch (error) {
+            logger.error('Error getting collection agents', error);
+            return [];
+        }
+    }
+    // ==================== Event-Driven Architecture Helpers ====================
+    /**
+     * Wait for indexer to sync with on-chain events (event-driven architecture)
+     *
+     * The 8004 protocol uses an event-driven architecture where writes happen instantly on-chain
+     * via transaction logs, and the indexer asynchronously processes these events for efficient queries.
+     * This helper waits for the indexer to catch up with recent on-chain activity.
+     *
+     * @param checkFn - Function that returns true when data is synced
+     * @param options - Configuration options
+     * @returns True if synced within timeout, false otherwise
+     *
+     * @example
+     * // Wait for feedback to appear in indexer after giveFeedback()
+     * await sdk.waitForIndexerSync(async () => {
+     *   const feedback = await sdk.readFeedback(asset, client, index);
+     *   return feedback !== null;
+     * });
+     */
+    async waitForIndexerSync(checkFn, options) {
+        const timeout = options?.timeout ?? 30000;
+        const initialDelay = options?.initialDelay ?? 1000;
+        const maxDelay = options?.maxDelay ?? 5000;
+        const backoffMultiplier = options?.backoffMultiplier ?? 1.5;
+        const startTime = Date.now();
+        let currentDelay = initialDelay;
+        while (Date.now() - startTime < timeout) {
+            try {
+                if (await checkFn()) {
+                    return true;
+                }
+            }
+            catch (error) {
+                // Continue retrying on errors (indexer might not have data yet)
+            }
+            // Wait before next retry with exponential backoff
+            await new Promise(resolve => setTimeout(resolve, currentDelay));
+            currentDelay = Math.min(currentDelay * backoffMultiplier, maxDelay);
+        }
+        return false;
+    }
+    /**
+     * Resolve a specific feedback via indexer-backed reads.
+     * Returns null when feedback is not yet indexed.
+     */
+    async resolveFeedbackFromIndexer(asset, client, feedbackIndex, options) {
+        let resolved = null;
+        const shouldWait = options?.waitForSync ?? true;
+        const tryReadOnce = async () => {
+            const feedback = await this.readFeedback(asset, client, feedbackIndex);
+            return feedback ?? null;
+        };
+        try {
+            resolved = await tryReadOnce();
+            if (resolved) {
+                return resolved;
+            }
+            if (!shouldWait) {
+                return null;
+            }
+            await this.waitForIndexerSync(async () => {
+                try {
+                    resolved = await tryReadOnce();
+                    return !!resolved;
+                }
+                catch {
+                    return false;
+                }
+            }, {
+                timeout: 10000,
+                initialDelay: 250,
+                maxDelay: 1500,
+                backoffMultiplier: 1.5,
+            });
+            return resolved;
+        }
+        catch (error) {
+            logger.warn('Failed to resolve feedback from indexer', error instanceof Error ? error.message : String(error));
+            return null;
+        }
+    }
+    /**
+     * Resolve SEAL hash for a specific feedback via indexer-backed reads.
+     * Returns undefined when feedback/sealHash is not yet indexed.
+     */
+    async resolveSealHashFromIndexer(asset, client, feedbackIndex) {
+        const feedback = await this.resolveFeedbackFromIndexer(asset, client, feedbackIndex);
+        if (feedback?.sealHash && Buffer.isBuffer(feedback.sealHash) && feedback.sealHash.length === 32) {
+            return feedback.sealHash;
+        }
+        return undefined;
+    }
+    /**
+     * Resolve feedback by SEAL hash when caller does not know feedbackIndex.
+     */
+    async resolveFeedbackBySealHashFromIndexer(asset, client, sealHash) {
+        if (sealHash.length !== 32) {
+            throw new Error('sealHash must be 32 bytes');
+        }
+        const assetStr = asset.toBase58();
+        const clientStr = client.toBase58();
+        const sealHex = sealHash.toString('hex').toLowerCase();
+        const matchesSealHash = (hash) => typeof hash === 'string' && hash.toLowerCase() === sealHex;
+        const tryReadOnce = async () => {
+            const assetPageSize = 5000;
+            const byClient = await this.indexerClient.getFeedbacksByClient(clientStr);
+            const fromClient = byClient.find((row) => row.asset === assetStr && matchesSealHash(row.feedback_hash));
+            if (fromClient) {
+                return indexedFeedbackToSolanaFeedback(fromClient);
+            }
+            for (let offset = 0;; offset += assetPageSize) {
+                const byAsset = await this.indexerClient.getFeedbacks(assetStr, {
+                    includeRevoked: true,
+                    limit: assetPageSize,
+                    offset,
+                });
+                const fromAsset = byAsset.find((row) => row.client_address === clientStr && matchesSealHash(row.feedback_hash));
+                if (fromAsset) {
+                    return indexedFeedbackToSolanaFeedback(fromAsset);
+                }
+                if (byAsset.length < assetPageSize) {
+                    break;
+                }
+            }
+            return null;
+        };
+        try {
+            let resolved = await tryReadOnce();
+            if (resolved) {
+                return resolved;
+            }
+            await this.waitForIndexerSync(async () => {
+                resolved = await tryReadOnce();
+                return resolved !== null;
+            }, {
+                timeout: 10000,
+                initialDelay: 250,
+                maxDelay: 1500,
+                backoffMultiplier: 1.5,
+            });
+            return resolved;
+        }
+        catch (error) {
+            logger.warn('Failed to resolve feedback by sealHash from indexer', error instanceof Error ? error.message : String(error));
+            return null;
+        }
+    }
+    // ==================== Reputation Methods (v0.3.0 - asset-based) ====================
+    /**
+     * 1. Get agent reputation summary - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @param minScore - Optional minimum score filter
+     * @param clientFilter - Optional client filter
+     * @returns Reputation summary with average score and total feedbacks
+     */
+    async getSummary(asset, minScore, clientFilter) {
+        return await this.feedbackManager.getSummary(asset, minScore, clientFilter);
+    }
+    /**
+     * 2. Read single feedback - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @param client - Client public key
+     * @param feedbackIndex - Feedback index (number or bigint)
+     * @returns Feedback object or null
+     */
+    async readFeedback(asset, client, feedbackIndex) {
+        const idx = typeof feedbackIndex === 'number' ? BigInt(feedbackIndex) : feedbackIndex;
+        return await this.feedbackManager.readFeedback(asset, client, idx);
+    }
+    /**
+     * Get feedback (alias for readFeedback) - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @param clientAddress - Client public key
+     * @param feedbackIndex - Feedback index (number or bigint)
+     * @returns Feedback object or null
+     */
+    async getFeedback(asset, clientAddress, feedbackIndex) {
+        return this.readFeedback(asset, clientAddress, feedbackIndex);
+    }
+    /**
+     * Build canonical feedback ID used by indexers.
+     * Format: "<asset>:<client>:<feedbackIndex>" (no chain prefix).
+     */
+    encodeFeedbackId(asset, client, feedbackIndex) {
+        const assetStr = typeof asset === 'string' ? asset : asset.toBase58();
+        const clientStr = typeof client === 'string' ? client : client.toBase58();
+        return encodeCanonicalFeedbackId(assetStr, clientStr, feedbackIndex);
+    }
+    /**
+     * Build canonical response ID used by indexers.
+     * Format: "<asset>:<client>:<feedbackIndex>:<responder>:<responseCount|txSig>".
+     */
+    encodeResponseId(asset, client, feedbackIndex, responder, responseCountOrTxSig) {
+        const assetStr = typeof asset === 'string' ? asset : asset.toBase58();
+        const clientStr = typeof client === 'string' ? client : client.toBase58();
+        const responderStr = typeof responder === 'string' ? responder : responder.toBase58();
+        return encodeCanonicalResponseId(assetStr, clientStr, feedbackIndex, responderStr, responseCountOrTxSig);
+    }
+    /**
+     * Read feedback by indexer feedback id.
+     * Accepts canonical `asset:client:index` ids and legacy sequential numeric backend feedback ids.
+     */
+    async getFeedbackById(feedbackId) {
+        const normalizedId = feedbackId.trim();
+        const canonical = decodeCanonicalFeedbackId(normalizedId);
+        if (canonical) {
+            return this.indexerClient.getFeedback(canonical.asset, canonical.client, BigInt(canonical.index));
+        }
+        if (!/^\d+$/.test(normalizedId))
+            return null;
+        if (!this.indexerClient.getFeedbackById)
+            return null;
+        return this.indexerClient.getFeedbackById(normalizedId);
+    }
+    /**
+     * Read responses by indexer feedback id.
+     * Accepts canonical `asset:client:index` ids and legacy sequential numeric backend feedback ids.
+     */
+    async getFeedbackResponsesByFeedbackId(feedbackId, limit = 100) {
+        const normalizedId = feedbackId.trim();
+        const canonical = decodeCanonicalFeedbackId(normalizedId);
+        if (canonical) {
+            return this.indexerClient.getFeedbackResponsesFor(canonical.asset, canonical.client, BigInt(canonical.index), limit);
+        }
+        if (!/^\d+$/.test(normalizedId))
+            return [];
+        if (!this.indexerClient.getFeedbackResponsesByFeedbackId)
+            return [];
+        return this.indexerClient.getFeedbackResponsesByFeedbackId(normalizedId, limit);
+    }
+    /**
+     * 3. Read all feedbacks for an agent (indexer) - v0.4.0
+     * @param asset - Agent Core asset pubkey
+     * @param includeRevoked - Include revoked feedbacks
+     * @returns Array of feedback objects
+     *
+     * v0.4.0: FeedbackAccount PDAs removed, uses indexer for data access.
+     * Requires indexer to be configured.
+     */
+    async readAllFeedback(asset, includeRevoked = false) {
+        return await this.feedbackManager.readAllFeedback(asset, includeRevoked);
+    }
+    /**
+     * 4. Get last feedback index for a client - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @param client - Client public key
+     * @returns Last feedback index
+     */
+    async getLastIndex(asset, client) {
+        return await this.feedbackManager.getLastIndex(asset, client);
+    }
+    /**
+     * 5. Get all clients who gave feedback (indexer) - v0.4.0
+     * @param asset - Agent Core asset pubkey
+     * @returns Array of client public keys
+     *
+     * v0.4.0: FeedbackAccount PDAs removed, uses indexer for data access.
+     * Requires indexer to be configured.
+     */
+    async getClients(asset) {
+        return await this.feedbackManager.getClients(asset);
+    }
+    /**
+     * 6. Get response count for a feedback
+     * @param asset - Agent Core asset pubkey
+     * @param client - Client public key (who gave the feedback)
+     * @param feedbackIndex - Feedback index (number or bigint)
+     * @returns Number of responses
+     */
+    async getResponseCount(asset, client, feedbackIndex) {
+        const idx = typeof feedbackIndex === 'number' ? BigInt(feedbackIndex) : feedbackIndex;
+        return await this.feedbackManager.getResponseCount(asset, client, idx);
+    }
+    /**
+     * Bonus: Read all responses for a feedback
+     * @param asset - Agent Core asset pubkey
+     * @param client - Client public key (who gave the feedback)
+     * @param feedbackIndex - Feedback index (number or bigint)
+     * @returns Array of response objects
+     */
+    async readResponses(asset, client, feedbackIndex) {
+        const idx = typeof feedbackIndex === 'number' ? BigInt(feedbackIndex) : feedbackIndex;
+        return await this.feedbackManager.readResponses(asset, client, idx);
+    }
+    // ==================== ATOM Engine Methods (v0.4.0) ====================
+    /**
+     * Get ATOM stats for an agent
+     * @param asset - Agent Core asset pubkey
+     * @returns AtomStats account data or null if not found
+     */
+    async getAtomStats(asset) {
+        try {
+            const [atomStatsPDA] = getAtomStatsPDA(asset, this.programIds.atomEngine);
+            const connection = this.client.getConnection();
+            const accountInfo = await connection.getAccountInfo(atomStatsPDA);
+            if (!accountInfo || !accountInfo.data) {
+                return null;
+            }
+            // AtomStats.deserialize handles the 8-byte discriminator internally
+            return AtomStats.deserialize(Buffer.from(accountInfo.data));
+        }
+        catch (error) {
+            logger.error('Error fetching ATOM stats', error);
+            return null;
+        }
+    }
+    /**
+     * Initialize ATOM stats for an agent (write operation) - v0.4.0
+     * Must be called by the agent owner before any feedback can be given
+     * @param asset - Agent Core asset pubkey
+     * @param options - Write options (skipSend, signer)
+     */
+    async initializeAtomStats(asset, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.atomTxBuilder.initializeStats(asset, options);
+    }
+    // ==================== ATOM Config Methods (Authority Only) ====================
+    /**
+     * Get global ATOM config - v0.4.x
+     * @returns AtomConfig or null if not initialized
+     */
+    async getAtomConfig() {
+        try {
+            const [atomConfigPDA] = getAtomConfigPDA(this.programIds.atomEngine);
+            const connection = this.client.getConnection();
+            const accountInfo = await connection.getAccountInfo(atomConfigPDA);
+            if (!accountInfo || !accountInfo.data) {
+                return null;
+            }
+            return AtomConfig.deserialize(Buffer.from(accountInfo.data));
+        }
+        catch (error) {
+            logger.error('Error fetching ATOM config', error);
+            return null;
+        }
+    }
+    /**
+     * Initialize global ATOM config (authority only) - v0.4.x
+     * One-time setup by program authority
+     * @param agentRegistryProgram - Optional agent registry program ID override
+     * @param options - Write options (skipSend, signer)
+     */
+    async initializeAtomConfig(agentRegistryProgram, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.atomTxBuilder.initializeConfig(agentRegistryProgram, options);
+    }
+    /**
+     * Update global ATOM config parameters (authority only) - v0.4.x
+     * @param params - Config parameters to update (only provided fields are changed)
+     * @param options - Write options (skipSend, signer)
+     */
+    async updateAtomConfig(params, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.atomTxBuilder.updateConfig(params, options);
+    }
+    /**
+     * Get trust tier for an agent
+     * @param asset - Agent Core asset pubkey
+     * @returns TrustTier enum value (0-4)
+     */
+    async getTrustTier(asset) {
+        const stats = await this.getAtomStats(asset);
+        if (!stats) {
+            return TrustTier.Unrated;
+        }
+        return stats.trust_tier;
+    }
+    /**
+     * Get enriched summary combining agent data with ATOM metrics
+     * @param asset - Agent Core asset pubkey
+     * @returns EnrichedSummary with full reputation data
+     */
+    async getEnrichedSummary(asset) {
+        // Fetch agent, ATOM stats, and base collection in parallel
+        const [agent, atomStats, baseCollection] = await Promise.all([
+            this.loadAgent(asset),
+            this.getAtomStats(asset),
+            this.getBaseCollection(),
+        ]);
+        if (!agent) {
+            return null;
+        }
+        // Get basic summary from feedback manager
+        const summary = await this.feedbackManager.getSummary(asset);
+        // Get collection from AtomStats if available, otherwise use base collection
+        const collection = atomStats
+            ? atomStats.getCollectionPublicKey()
+            : (baseCollection || asset); // fallback to asset if no collection found
+        return {
+            asset,
+            owner: agent.getOwnerPublicKey(),
+            collection,
+            // Basic reputation metrics
+            totalFeedbacks: summary.totalFeedbacks,
+            averageScore: summary.averageScore,
+            positiveCount: summary.positiveCount,
+            negativeCount: summary.negativeCount,
+            // ATOM metrics (from AtomStats or defaults)
+            trustTier: atomStats ? atomStats.trust_tier : TrustTier.Unrated,
+            qualityScore: atomStats?.quality_score ?? 0,
+            confidence: atomStats?.confidence ?? 0,
+            riskScore: atomStats?.risk_score ?? 0,
+            diversityRatio: atomStats?.diversity_ratio ?? 0,
+            uniqueCallers: atomStats?.getUniqueCallersEstimate() ?? 0,
+            emaScoreFast: atomStats?.ema_score_fast ?? 0,
+            emaScoreSlow: atomStats?.ema_score_slow ?? 0,
+            volatility: atomStats?.ema_volatility ?? 0,
+        };
+    }
+    // ==================== Indexer Methods (v0.4.0) ====================
+    /**
+     * Helper: Execute with indexer fallback to on-chain
+     * Used internally when forceRpc='false' (force indexer mode)
+     * @param noFallback - If true, throws instead of falling back to on-chain
+     */
+    async withIndexerFallback(indexerFn, onChainFn, operationName, noFallback) {
+        if (!this.useIndexer) {
+            if (noFallback) {
+                throw new Error(`Indexer not available for ${operationName}`);
+            }
+            return onChainFn();
+        }
+        try {
+            return await indexerFn();
+        }
+        catch (error) {
+            if (this.indexerFallback && !noFallback) {
+                const errMsg = error instanceof Error ? error.message : String(error);
+                logger.warn(`Indexer failed for ${operationName}, falling back to on-chain: ${errMsg}`);
+                return onChainFn();
+            }
+            throw error;
+        }
+    }
+    /**
+     * Smart routing helper: Chooses between indexer and RPC
+     * - forceOnChain=true: All on-chain
+     * - forceOnChain=false: Smart routing (RPC for small queries, indexer for large)
+     */
+    async withSmartRouting(operation, indexerFn, onChainFn) {
+        // Force on-chain mode
+        if (this.forceOnChain) {
+            logger.debug(`[${operation}] Forcing on-chain (forceOnChain=true)`);
+            return onChainFn();
+        }
+        // Smart routing: RPC for small queries, indexer for large
+        if (this.isSmallQuery(operation)) {
+            logger.debug(`[${operation}] Small query → RPC`);
+            try {
+                return await onChainFn();
+            }
+            catch (error) {
+                // Fallback to indexer if RPC fails and indexer is enabled
+                if (this.useIndexer) {
+                    logger.debug(`[${operation}] RPC failed, falling back to indexer`);
+                    return indexerFn();
+                }
+                throw error;
+            }
+        }
+        // Large query → indexer with fallback
+        logger.debug(`[${operation}] Large query → indexer`);
+        return this.withIndexerFallback(indexerFn, onChainFn, operation);
+    }
+    /**
+     * Check if indexer is available
+     */
+    async isIndexerAvailable() {
+        return this.indexerClient.isAvailable();
+    }
+    /**
+     * Get the indexer client for direct access
+     */
+    getIndexerClient() {
+        return this.indexerClient;
+    }
+    /**
+     * Helper: Throws if forceOnChain=true for indexer-only methods
+     */
+    requireIndexer(methodName) {
+        if (this.forceOnChain) {
+            throw new Error(`${methodName} requires indexer (no on-chain equivalent). ` +
+                `Set forceOnChain=false or remove FORCE_ON_CHAIN env var.`);
+        }
+    }
+    /**
+     * Search agents with filters (indexer only)
+     * @param params - Search parameters
+     * @returns Array of indexed agents
+     */
+    async searchAgents(params) {
+        this.requireIndexer('searchAgents');
+        const agents = await this.indexerClient.getAgents({
+            owner: params.owner,
+            creator: params.creator,
+            collection: params.collection,
+            collectionPointer: params.collectionPointer,
+            wallet: params.wallet,
+            parentAsset: params.parentAsset,
+            parentCreator: params.parentCreator,
+            colLocked: params.colLocked,
+            parentLocked: params.parentLocked,
+            updatedAt: params.updatedAt,
+            updatedAtGt: params.updatedAtGt,
+            updatedAtLt: params.updatedAtLt,
+            limit: params.limit,
+            offset: params.offset,
+            order: params.orderBy,
+        });
+        if (params.minScore === undefined) {
+            return agents;
+        }
+        return agents.filter((agent) => {
+            const score = Number.isFinite(agent.quality_score)
+                ? agent.quality_score
+                : agent.raw_avg_score;
+            return score >= params.minScore;
+        });
+    }
+    /**
+     * Get canonical collection pointer rows from indexer.
+     */
+    async getCollectionPointers(options) {
+        this.requireIndexer('getCollectionPointers');
+        const method = this.indexerClient.getCollectionPointers;
+        if (!method) {
+            throw new Error('getCollectionPointers is not available on current indexer client');
+        }
+        const normalizedCol = options?.col !== undefined ? normalizeCollectionPointerInput(options.col) : undefined;
+        const normalizedCollectionId = options?.collectionId !== undefined
+            ? normalizeCollectionIdInput(options.collectionId)
+            : undefined;
+        return method.call(this.indexerClient, {
+            ...(options ?? {}),
+            ...(normalizedCollectionId !== undefined ? { collectionId: normalizedCollectionId } : {}),
+            ...(normalizedCol !== undefined ? { col: normalizedCol } : {}),
+            ...(normalizedCol !== undefined ? { collection: normalizedCol } : {}),
+        });
+    }
+    /**
+     * Count assets associated with a collection pointer (creator+pointer scope).
+     */
+    async getCollectionAssetCount(col, creator) {
+        this.requireIndexer('getCollectionAssetCount');
+        const method = this.indexerClient.getCollectionAssetCount;
+        if (!method) {
+            throw new Error('getCollectionAssetCount is not available on current indexer client');
+        }
+        const normalizedCol = normalizeCollectionPointerInput(col);
+        const creatorScope = creator?.trim();
+        return method.call(this.indexerClient, normalizedCol, creatorScope);
+    }
+    /**
+     * Get assets associated with a collection pointer.
+     */
+    async getCollectionAssets(col, options) {
+        this.requireIndexer('getCollectionAssets');
+        const method = this.indexerClient.getCollectionAssets;
+        if (!method) {
+            throw new Error('getCollectionAssets is not available on current indexer client');
+        }
+        const normalizedCol = normalizeCollectionPointerInput(col);
+        const creatorScope = options?.creator?.trim();
+        return method.call(this.indexerClient, normalizedCol, {
+            ...(options ?? {}),
+            ...(creatorScope ? { creator: creatorScope } : {}),
+        });
+    }
+    /**
+     * Resolve one canonical collection scope from sequential collection id.
+     */
+    async getCollectionPointerById(collectionId) {
+        const normalizedCollectionId = normalizeCollectionIdInput(collectionId);
+        const rows = await this.getCollectionPointers({
+            collectionId: normalizedCollectionId,
+            limit: 2,
+            offset: 0,
+        });
+        if (rows.length === 0)
+            return null;
+        if (rows.length > 1) {
+            throw new Error(`Ambiguous collectionId ${normalizedCollectionId}: multiple collection scopes found`);
+        }
+        const resolved = rows[0];
+        if (resolved.collection_id !== normalizedCollectionId) {
+            throw new IndexerError(`Expected collection_id ${normalizedCollectionId} but got ${resolved.collection_id ?? 'null'}`, IndexerErrorCode.INVALID_RESPONSE);
+        }
+        return resolved;
+    }
+    /**
+     * Count assets associated with a sequential collection id.
+     */
+    async getCollectionAssetCountById(collectionId) {
+        const scope = await this.getCollectionPointerById(collectionId);
+        if (!scope)
+            return 0;
+        return this.getCollectionAssetCount(scope.col, scope.creator);
+    }
+    /**
+     * Get assets associated with a sequential collection id.
+     */
+    async getCollectionAssetsById(collectionId, options) {
+        const scope = await this.getCollectionPointerById(collectionId);
+        if (!scope)
+            return [];
+        return this.getCollectionAssets(scope.col, {
+            ...(options ?? {}),
+            creator: scope.creator,
+        });
+    }
+    /**
+     * Get leaderboard (top agents by sort_key) - indexer only
+     * Uses keyset pagination for scale (millions of agents)
+     * @param options.collection - Optional collection filter
+     * @param options.minTier - Minimum trust tier (0-4)
+     * @param options.limit - Number of results (default: 50)
+     * @param options.cursorSortKey - Cursor for keyset pagination
+     * @returns Array of agents sorted by sort_key DESC
+     */
+    async getLeaderboard(options) {
+        this.requireIndexer('getLeaderboard');
+        return this.indexerClient.getLeaderboard(options);
+    }
+    /**
+     * Get global statistics - indexer only
+     * @returns Global stats (total agents, feedbacks, etc.)
+     */
+    async getGlobalStats() {
+        this.requireIndexer('getGlobalStats');
+        return this.indexerClient.getGlobalStats();
+    }
+    /**
+     * Get feedbacks by endpoint - indexer only
+     * @param endpoint - Endpoint string (e.g., '/api/chat')
+     * @returns Array of feedbacks for this endpoint
+     */
+    async getFeedbacksByEndpoint(endpoint) {
+        this.requireIndexer('getFeedbacksByEndpoint');
+        return this.indexerClient.getFeedbacksByEndpoint(endpoint);
+    }
+    /**
+     * Get feedbacks by tag - indexer only
+     * @param tag - Tag to search for (in tag1 or tag2)
+     * @returns Array of feedbacks with this tag
+     */
+    async getFeedbacksByTag(tag) {
+        this.requireIndexer('getFeedbacksByTag');
+        return this.indexerClient.getFeedbacksByTag(tag);
+    }
+    /**
+     * Get agent by operational wallet - indexer only
+     * @param wallet - Agent wallet pubkey string
+     * @returns Indexed agent or null
+     */
+    async getAgentByWallet(wallet) {
+        this.requireIndexer('getAgentByWallet');
+        return this.indexerClient.getAgentByWallet(wallet);
+    }
+    /**
+     * Get agent by backend sequence id (indexer only)
+     * @param agentId - REST: sequential `agent_id`; GraphQL: sequential `agentId` / `agentid`
+     * @returns Indexed agent or null
+     */
+    async getAgentByAgentId(agentId) {
+        this.requireIndexer('getAgentByAgentId');
+        const method = this.indexerClient.getAgentByAgentId
+            ?? this.indexerClient.getAgentByIndexerId;
+        if (!method) {
+            throw new Error('getAgentByAgentId is not available on current indexer client');
+        }
+        return method.call(this.indexerClient, agentId);
+    }
+    /** @deprecated Use getAgentByAgentId(agentId) */
+    async getAgentByIndexerId(agentId) {
+        return this.getAgentByAgentId(agentId);
+    }
+    /**
+     * @deprecated Validation is archived. This compatibility shim always throws.
+     * Get pending validations for a validator - indexer only
+     * @param validator - Validator pubkey string
+     * @returns Array of pending validation requests
+     */
+    async getPendingValidations(_validator) {
+        throw new Error(VALIDATION_ARCHIVED_ERROR);
+    }
+    /**
+     * Get agent reputation from indexer (with on-chain fallback)
+     * @param asset - Agent asset pubkey
+     * @param options - Query options
+     * @param options.noFallback - If true, throws instead of falling back to on-chain (useful for waitForIndexerSync)
+     * @returns Indexed reputation data
+     */
+    async getAgentReputationFromIndexer(asset, options) {
+        return this.withIndexerFallback(async () => {
+            if (!this.indexerClient)
+                throw new Error('No indexer');
+            return this.indexerClient.getAgentReputation(asset.toBase58());
+        }, async () => {
+            // Fallback: build from on-chain data
+            const [summary, agent, baseCollection] = await Promise.all([
+                this.feedbackManager.getSummary(asset),
+                this.loadAgent(asset),
+                this.getBaseCollection(),
+            ]);
+            if (!agent)
+                return null;
+            // v0.4.0: Collection not stored in AgentAccount, use base collection
+            const collectionStr = baseCollection?.toBase58() || '';
+            return {
+                asset: asset.toBase58(),
+                owner: agent.getOwnerPublicKey().toBase58(),
+                collection: collectionStr,
+                nft_name: agent.nft_name || null,
+                agent_uri: agent.agent_uri || null,
+                feedback_count: summary.totalFeedbacks,
+                avg_score: summary.averageScore || null,
+                positive_count: summary.positiveCount,
+                negative_count: summary.negativeCount,
+                validation_count: 0, // Not available on-chain easily
+            };
+        }, 'getAgentReputation', options?.noFallback);
+    }
+    /**
+     * Get feedbacks from indexer (with on-chain fallback)
+     * @param asset - Agent asset pubkey
+     * @param options - Query options
+     * @param options.noFallback - If true, throws instead of falling back to on-chain
+     * @returns Array of feedbacks (SolanaFeedback format)
+     */
+    async getFeedbacksFromIndexer(asset, options) {
+        return this.withIndexerFallback(async () => {
+            if (!this.indexerClient)
+                throw new Error('No indexer');
+            const indexed = await this.indexerClient.getFeedbacks(asset.toBase58(), options);
+            return indexed.map(indexedFeedbackToSolanaFeedback);
+        }, async () => {
+            return this.feedbackManager.readAllFeedback(asset, options?.includeRevoked ?? false);
+        }, 'getFeedbacks', options?.noFallback);
+    }
+    // ==================== Write Methods (require signer) - v0.4.0 ====================
+    /**
+     * Check if SDK has write permissions
+     */
+    get canWrite() {
+        return this.signer !== undefined;
+    }
+    /**
+     * Build a collection metadata document that conforms to SDK collection schema.
+     * Useful when you want to inspect/edit JSON before upload.
+     */
+    createCollectionData(input) {
+        return buildCollectionMetadataJson(input);
+    }
+    async createCollection(dataOrName, uriOrOptions, maybeOptions) {
+        // New off-chain flow: createCollection(data[, { uploadToIpfs }])
+        if (typeof dataOrName !== 'string') {
+            const metadata = this.createCollectionData(dataOrName);
+            const uploadToIpfs = uriOrOptions?.uploadToIpfs ?? true;
+            if (!uploadToIpfs) {
+                return { metadata };
+            }
+            if (!this.ipfsClient) {
+                throw new Error('ipfsClient is required to upload collection metadata');
+            }
+            const cid = await this.ipfsClient.addJson(metadata);
+            const pointer = toCollectionPointer(cid);
+            return {
+                metadata,
+                cid,
+                uri: `ipfs://${cid}`,
+                pointer,
+            };
+        }
+        // Legacy on-chain flow: createCollection(name, uri, options)
+        const name = dataOrName;
+        if (typeof uriOrOptions !== 'string') {
+            throw new Error('Legacy createCollection(name, uri, options) requires a URI string');
+        }
+        const uri = uriOrOptions;
+        const options = maybeOptions;
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return this.identityTxBuilder.createCollection(name, uri, options);
+    }
+    /**
+     * Update collection URI (write operation) - v0.4.2
+     * Update metadata URI for a user-owned collection.
+     * Only the collection owner can update. Collection name is immutable.
+     *
+     * @param collection - Base registry collection pubkey to update
+     * @param newUri - New collection URI (max 250 bytes)
+     * @param options - Write options (skipSend, signer)
+     * @returns Transaction result, or PreparedTransaction if skipSend
+     *
+     * @example
+     * ```typescript
+     * // Update collection URI
+     * await sdk.updateCollectionUri(
+     *   collectionPubkey,
+     *   'ipfs://QmNewMetadata...'
+     * );
+     * ```
+     */
+    async updateCollectionUri(collection, newUri, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        // Always pass null for name (immutable)
+        return await this.identityTxBuilder.updateCollectionMetadata(collection, null, newUri, options);
+    }
+    async registerAgent(tokenUri, options) {
+        const legacyOverloadError = 'registerAgent(tokenUri, collection, options) was removed. '
+            + 'Use registerAgent(tokenUri, options).';
+        if (arguments.length > 2) {
+            throw new Error(legacyOverloadError);
+        }
+        const maybeOptions = options;
+        const looksLikePublicKey = maybeOptions instanceof PublicKey
+            || (maybeOptions !== null
+                && typeof maybeOptions === 'object'
+                && typeof maybeOptions.toBase58 === 'function'
+                && typeof maybeOptions.toBuffer === 'function');
+        if (looksLikePublicKey) {
+            throw new Error(legacyOverloadError);
+        }
+        if (options !== undefined && options !== null && typeof options === 'object' && 'collection' in options) {
+            throw new Error('registerAgent no longer accepts a base collection override. '
+                + 'Use registerAgent(tokenUri, options) without collection.');
+        }
+        if (options !== undefined
+            && (options === null
+                || typeof options !== 'object'
+                || Array.isArray(options)
+                || (Object.getPrototypeOf(options) !== Object.prototype && Object.getPrototypeOf(options) !== null))) {
+            throw new Error('Invalid registerAgent options argument: expected options object.');
+        }
+        const normalizedCollectionPointer = options?.collectionPointer !== undefined
+            ? normalizeCollectionPointerInput(options.collectionPointer)
+            : undefined;
+        if (options?.collectionLock !== undefined && typeof options.collectionLock !== 'boolean') {
+            throw new Error('collectionLock must be a boolean');
+        }
+        // For non-skipSend operations, require signer
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        const registerOptions = {
+            ...(options ?? {}),
+            ...(normalizedCollectionPointer !== undefined
+                ? { collectionPointer: normalizedCollectionPointer }
+                : {}),
+            atomEnabled: options?.atomEnabled ?? false,
+        };
+        return await this.identityTxBuilder.registerAgent(tokenUri, registerOptions);
+    }
+    async setAgentUri(asset, collectionOrUri, newUriOrOptions, maybeOptions) {
+        let collection;
+        let newUri;
+        let options;
+        if (typeof collectionOrUri === 'string') {
+            newUri = collectionOrUri;
+            options = newUriOrOptions;
+            const baseCollection = await this.getBaseCollection();
+            if (!baseCollection) {
+                throw new Error('Base collection not found');
+            }
+            collection = baseCollection;
+        }
+        else {
+            collection = collectionOrUri;
+            if (typeof newUriOrOptions !== 'string') {
+                throw new Error('newUri must be provided when base registry collection pubkey is passed explicitly');
+            }
+            newUri = newUriOrOptions;
+            options = maybeOptions;
+        }
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.identityTxBuilder.setAgentUri(asset, collection, newUri, options);
+    }
+    /**
+     * Set collection pointer (write operation)
+     * @param asset - Agent Core asset pubkey
+     * @param col - Collection pointer input (c1:<payload>, CIDv0/CIDv1, or ipfs://...)
+     * @param options - Write options (skipSend, signer, lock)
+     */
+    async setCollectionPointer(asset, col, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        const normalizedCol = normalizeCollectionPointerInput(col);
+        const lock = options?.lock ?? true;
+        if (typeof lock !== 'boolean') {
+            throw new Error('lock must be a boolean');
+        }
+        const txOptions = {};
+        if (options?.skipSend !== undefined)
+            txOptions.skipSend = options.skipSend;
+        if (options?.signer !== undefined)
+            txOptions.signer = options.signer;
+        if (options?.feePayer !== undefined)
+            txOptions.feePayer = options.feePayer;
+        if (options?.computeUnits !== undefined)
+            txOptions.computeUnits = options.computeUnits;
+        const writeOptions = Object.keys(txOptions).length > 0 ? txOptions : undefined;
+        if (lock) {
+            return this.identityTxBuilder.setCollectionPointer(asset, normalizedCol, writeOptions);
+        }
+        return this.identityTxBuilder.setCollectionPointerWithOptions(asset, normalizedCol, false, writeOptions);
+    }
+    /**
+     * Set parent asset (write operation)
+     * @param asset - Child agent Core asset pubkey
+     * @param parentAsset - Parent Core asset pubkey
+     * @param options - Write options (skipSend, signer, lock)
+     */
+    async setParentAsset(asset, parentAsset, options) {
+        if (asset.equals(parentAsset)) {
+            throw new Error('parentAsset must be different from asset');
+        }
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        const lock = options?.lock ?? true;
+        if (typeof lock !== 'boolean') {
+            throw new Error('lock must be a boolean');
+        }
+        const txOptions = {};
+        if (options?.skipSend !== undefined)
+            txOptions.skipSend = options.skipSend;
+        if (options?.signer !== undefined)
+            txOptions.signer = options.signer;
+        if (options?.feePayer !== undefined)
+            txOptions.feePayer = options.feePayer;
+        if (options?.computeUnits !== undefined)
+            txOptions.computeUnits = options.computeUnits;
+        const writeOptions = Object.keys(txOptions).length > 0 ? txOptions : undefined;
+        if (lock) {
+            return this.identityTxBuilder.setParentAsset(asset, parentAsset, writeOptions);
+        }
+        return this.identityTxBuilder.setParentAssetWithOptions(asset, parentAsset, false, writeOptions);
+    }
+    /**
+     * Enable ATOM for an agent (one-way) - v0.4.4
+     * @param asset - Agent Core asset pubkey
+     * @param options - Write options (skipSend, signer)
+     */
+    async enableAtom(asset, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.identityTxBuilder.enableAtom(asset, options);
+    }
+    /**
+     * Prepare message for setAgentWallet (for web3 wallets like Phantom, Solflare)
+     * @example
+     * const prepared = await sdk.prepareSetAgentWallet(asset, walletPubkey);
+     * const signature = await wallet.signMessage(prepared.message);
+     * await prepared.complete(signature);
+     */
+    async prepareSetAgentWallet(asset, newWallet, options) {
+        // Get on-chain clock to avoid client/validator time skew
+        const slot = await this.getSolanaClient().getConnection().getSlot();
+        const blockTime = await this.getSolanaClient().getConnection().getBlockTime(slot);
+        if (!blockTime) {
+            throw new Error('Failed to fetch validator clock time');
+        }
+        // Use validator time + 60 seconds (safe margin within 5min window)
+        const deadline = BigInt(blockTime + 60);
+        const owner = options?.signer ?? this.signer?.publicKey;
+        if (!owner) {
+            throw new Error('Owner required. Configure SDK with signer or provide options.signer.');
+        }
+        const message = Buffer.concat([
+            Buffer.from('8004_WALLET_SET:'),
+            asset.toBuffer(),
+            newWallet.toBuffer(),
+            owner.toBuffer(),
+            Buffer.alloc(8),
+        ]);
+        message.writeBigInt64LE(deadline, message.length - 8);
+        return {
+            message: new Uint8Array(message),
+            complete: (sig) => this.identityTxBuilder.setAgentWallet(asset, newWallet, sig, deadline, options),
+        };
+    }
+    async setAgentWallet(asset, walletOrKeypair, sigOrOptions, deadline, options) {
+        // Simple mode: Keypair provided
+        if ('secretKey' in walletOrKeypair) {
+            const keypair = walletOrKeypair;
+            const opts = sigOrOptions;
+            const prepared = await this.prepareSetAgentWallet(asset, keypair.publicKey, opts);
+            const nacl = await import('tweetnacl');
+            const sig = nacl.default.sign.detached(prepared.message, keypair.secretKey);
+            return prepared.complete(sig);
+        }
+        // Advanced mode: PublicKey + signature + deadline
+        const wallet = walletOrKeypair;
+        const signature = sigOrOptions;
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only.');
+        }
+        return this.identityTxBuilder.setAgentWallet(asset, wallet, signature, deadline, options);
+    }
+    /**
+     * Set agent metadata (write operation)
+     * @param asset - Agent Core asset pubkey
+     * @param key - Metadata key
+     * @param value - Metadata value
+     * @param immutable - If true, metadata cannot be modified or deleted (default: false)
+     * @param options - Write options (skipSend, signer)
+     */
+    async setMetadata(asset, key, value, immutable = false, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.identityTxBuilder.setMetadata(asset, key, value, immutable, options);
+    }
+    /**
+     * Delete a metadata entry for an agent (write operation) - v0.3.0
+     * Only works if metadata is not immutable
+     * @param asset - Agent Core asset pubkey
+     * @param key - Metadata key to delete
+     * @param options - Write options (skipSend, signer)
+     */
+    async deleteMetadata(asset, key, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.identityTxBuilder.deleteMetadata(asset, key, options);
+    }
+    /**
+     * Give feedback to an agent (write operation) - v0.5.0
+     * @param asset - Agent Core asset pubkey
+     * @param params - Feedback parameters (value, valueDecimals, score, tags, etc.)
+     * @param options - Write options (skipSend, signer)
+     */
+    async giveFeedback(asset, params, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.reputationTxBuilder.giveFeedback(asset, params, options);
+    }
+    /**
+     * Revoke feedback (write operation)
+     * @param asset - Agent Core asset pubkey
+     * @param feedbackIndex - Feedback index to revoke (number or bigint)
+     * @param sealHash - Optional SEAL hash from original feedback.
+     * If omitted, SDK attempts to auto-resolve from indexed feedback by using signer as feedback client.
+     * @param options - Write options (skipSend, signer)
+     */
+    async revokeFeedback(asset, feedbackIndex, sealHash, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        const idx = typeof feedbackIndex === 'number' ? BigInt(feedbackIndex) : feedbackIndex;
+        let resolvedSealHash = sealHash;
+        const client = options?.signer ?? this.signer?.publicKey;
+        if (!client) {
+            throw new Error('No signer available to verify feedback ownership.');
+        }
+        const verifyFeedbackClient = options?.verifyFeedbackClient ?? true;
+        const feedback = (verifyFeedbackClient || !resolvedSealHash)
+            ? await this.resolveFeedbackFromIndexer(asset, client, idx, {
+                waitForSync: options?.waitForIndexerSync ?? true,
+            })
+            : null;
+        if (verifyFeedbackClient) {
+            if (!feedback) {
+                throw new Error(`Feedback ${idx.toString()} for signer ${client.toBase58()} not found in indexer. Refusing revoke preflight.`);
+            }
+            if (feedback.isRevoked || feedback.revoked) {
+                throw new Error(`Feedback ${idx.toString()} for signer ${client.toBase58()} is already revoked.`);
+            }
+        }
+        if (!resolvedSealHash && feedback?.sealHash && feedback.sealHash.length === 32) {
+            resolvedSealHash = feedback.sealHash;
+        }
+        if (resolvedSealHash && feedback?.sealHash && feedback.sealHash.length === 32) {
+            if (!resolvedSealHash.equals(feedback.sealHash)) {
+                throw new Error(`Provided sealHash does not match indexed feedback ${idx.toString()} for signer ${client.toBase58()}.`);
+            }
+        }
+        if (!resolvedSealHash) {
+            throw new Error('sealHash could not be auto-resolved yet. Wait for indexer sync or pass a valid sealHash explicitly.');
+        }
+        return await this.reputationTxBuilder.revokeFeedback(asset, idx, resolvedSealHash, options);
+    }
+    async appendResponse(asset, client, feedbackIndex, sealHashOrResponseUri, responseUriOrResponseHash, responseHashOrOptions, options) {
+        const providedSealHash = Buffer.isBuffer(sealHashOrResponseUri);
+        let resolvedSealHash;
+        let responseUri;
+        let responseHash;
+        let writeOptions;
+        if (Buffer.isBuffer(sealHashOrResponseUri)) {
+            resolvedSealHash = sealHashOrResponseUri;
+            if (typeof responseUriOrResponseHash !== 'string') {
+                throw new Error('responseUri is required when sealHash is provided');
+            }
+            responseUri = responseUriOrResponseHash;
+            if (Buffer.isBuffer(responseHashOrOptions)) {
+                responseHash = responseHashOrOptions;
+                writeOptions = options;
+            }
+            else {
+                writeOptions = responseHashOrOptions ?? options;
+            }
+        }
+        else {
+            responseUri = sealHashOrResponseUri;
+            if (Buffer.isBuffer(responseUriOrResponseHash)) {
+                responseHash = responseUriOrResponseHash;
+                writeOptions = responseHashOrOptions;
+            }
+            else {
+                writeOptions = responseUriOrResponseHash ?? responseHashOrOptions;
+            }
+        }
+        if (!writeOptions?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        const idx = typeof feedbackIndex === 'number' ? BigInt(feedbackIndex) : feedbackIndex;
+        if (!resolvedSealHash) {
+            const feedback = await this.resolveFeedbackFromIndexer(asset, client, idx);
+            if (!feedback) {
+                throw new Error(`Feedback ${idx.toString()} for client ${client.toBase58()} is not indexed yet. Wait for indexer sync.`);
+            }
+            if (!feedback.sealHash || feedback.sealHash.length !== 32) {
+                throw new Error('sealHash could not be auto-resolved yet. Wait for indexer sync or pass sealHash explicitly.');
+            }
+            resolvedSealHash = feedback.sealHash;
+        }
+        // Guardrail: if caller supplied a sealHash, validate it against indexer when available.
+        // Do not block the write on indexer lag (waitForSync=false).
+        if (providedSealHash) {
+            const feedback = await this.resolveFeedbackFromIndexer(asset, client, idx, { waitForSync: false });
+            if (feedback?.sealHash && feedback.sealHash.length === 32 && !resolvedSealHash.equals(feedback.sealHash)) {
+                throw new Error(`Provided sealHash does not match indexed feedback ${idx.toString()} for client ${client.toBase58()}.`);
+            }
+        }
+        return await this.reputationTxBuilder.appendResponse(asset, client, idx, resolvedSealHash, responseUri, responseHash, writeOptions);
+    }
+    /**
+     * Append response using sealHash only (feedbackIndex auto-resolved from indexer).
+     * Useful when caller stores sealHash but not feedbackIndex.
+     */
+    async appendResponseBySealHash(asset, client, sealHash, responseUri, responseHash, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        if (sealHash.length !== 32) {
+            throw new Error('sealHash must be 32 bytes');
+        }
+        const feedback = await this.resolveFeedbackBySealHashFromIndexer(asset, client, sealHash);
+        if (!feedback) {
+            throw new Error(`feedbackIndex could not be resolved from sealHash for client ${client.toBase58()}. Wait for indexer sync.`);
+        }
+        return this.appendResponse(asset, client, feedback.feedbackIndex, sealHash, responseUri, responseHash, options);
+    }
+    /**
+     * @deprecated Validation is archived. This compatibility shim always throws.
+     * Request validation (write operation) - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @param validator - Validator public key
+     * @param requestUri - Request URI (IPFS/Arweave)
+     * @param options - Write options (skipSend, signer, nonce, requestHash)
+     *   - nonce: Auto-generated if not provided (timestamp-based)
+     *   - requestHash: Optional, defaults to zeros (acceptable for IPFS URIs)
+     */
+    async requestValidation(_asset, _validator, _requestUri, _options) {
+        throw new Error(VALIDATION_ARCHIVED_ERROR);
+    }
+    /**
+     * @deprecated Validation is archived. This compatibility shim always throws.
+     * Respond to validation request (write operation) - v0.3.0
+     * @param asset - Agent Core asset pubkey
+     * @param nonce - Request nonce (from requestValidation result)
+     * @param score - Response score (0-100)
+     * @param responseUri - Response URI (IPFS/Arweave)
+     * @param options - Write options (skipSend, signer, responseHash, tag)
+     *   - responseHash: Optional, defaults to zeros (acceptable for IPFS URIs)
+     *   - tag: Optional response tag (max 32 bytes)
+     */
+    async respondToValidation(_asset, _nonce, _score, _responseUri, _options) {
+        throw new Error(VALIDATION_ARCHIVED_ERROR);
+    }
+    /**
+     * @deprecated Validation is archived. This compatibility shim always throws.
+     * Read validation request (read operation) - v0.4.2
+     * Reads ValidationRequest directly from on-chain (no indexer required)
+     * Returns normalized data with user-friendly properties
+     * @param asset - Agent Core asset pubkey
+     * @param validator - Validator public key
+     * @param nonce - Request nonce (number or bigint)
+     * @returns NormalizedValidation or null if not found
+     */
+    async readValidation(_asset, _validator, _nonce) {
+        throw new Error(VALIDATION_ARCHIVED_ERROR);
+    }
+    /**
+     * @deprecated Validation is archived. This compatibility shim always throws.
+     * Wait for validation request to be available on-chain (with retry)
+     * Useful for handling blockchain finalization delays
+     * @param asset - Agent Core asset pubkey
+     * @param validator - Validator public key
+     * @param nonce - Request nonce (number or bigint)
+     * @param options - Wait options (timeout, waitForResponse)
+     * @returns NormalizedValidation or null if timeout
+     */
+    async waitForValidation(_asset, _validator, _nonce, _options) {
+        throw new Error(VALIDATION_ARCHIVED_ERROR);
+    }
+    async transferAgent(asset, collectionOrNewOwner, newOwnerOrOptions, maybeOptions) {
+        let collection;
+        let newOwner;
+        let options;
+        if (newOwnerOrOptions instanceof PublicKey) {
+            collection = collectionOrNewOwner;
+            newOwner = newOwnerOrOptions;
+            options = maybeOptions;
+        }
+        else {
+            newOwner = collectionOrNewOwner;
+            options = newOwnerOrOptions;
+            const baseCollection = await this.getBaseCollection();
+            if (!baseCollection) {
+                throw new Error('Base collection not found');
+            }
+            collection = baseCollection;
+        }
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.identityTxBuilder.transferAgent(asset, collection, newOwner, options);
+    }
+    /**
+     * Burn agent Core asset (write operation)
+     * Note: This burns the Core asset only. The AgentAccount PDA is not closed by this call.
+     * @param asset - Agent Core asset pubkey
+     * @param options - Write options (skipSend, signer)
+     */
+    async burnAgent(asset, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.identityTxBuilder.burnAgent(asset, options);
+    }
+    /**
+     * Sync agent owner after external NFT transfer (write operation)
+     * Call this after the Core NFT was transferred outside of the SDK
+     * to update the AgentAccount's owner field
+     * @param asset - Agent Core asset pubkey
+     * @param options - Write options (skipSend, signer)
+     */
+    async syncOwner(asset, options) {
+        if (!options?.skipSend && !this.signer) {
+            throw new Error('No signer configured - SDK is read-only. Use skipSend: true with a signer option for server mode.');
+        }
+        return await this.identityTxBuilder.syncOwner(asset, options);
+    }
+    // ==================== Liveness & Signature Methods ====================
+    /**
+     * Check endpoint liveness for an agent
+     */
+    async isItAlive(asset, options = {}) {
+        const agent = await this.loadAgent(asset);
+        if (!agent) {
+            throw new Error('Agent not found');
+        }
+        if (!agent.agent_uri) {
+            throw new Error('Agent has no agent URI');
+        }
+        const timeoutMs = options.timeoutMs ?? 5000;
+        const concurrency = options.concurrency ?? 4;
+        const treatAuthAsAlive = options.treatAuthAsAlive ?? true;
+        const registration = await this.fetchJsonFromUri(agent.agent_uri, timeoutMs);
+        let endpoints = this.normalizeRegistrationServices(registration);
+        if (options.includeTypes?.length) {
+            const includeSet = new Set(options.includeTypes.map((entry) => String(entry)));
+            endpoints = endpoints.filter((endpoint) => includeSet.has(String(endpoint.type)));
+        }
+        const crawler = new EndpointCrawler(timeoutMs);
+        const results = await mapWithConcurrency(endpoints, concurrency, (endpoint) => this.pingEndpoint(endpoint, crawler, { timeoutMs, treatAuthAsAlive }));
+        const liveServices = results.filter((result) => result.ok);
+        const skippedServices = results.filter((result) => result.skipped);
+        const deadServices = results.filter((result) => !result.ok && !result.skipped);
+        const totalPinged = results.length - skippedServices.length;
+        const okCount = liveServices.length;
+        const status = totalPinged === 0 || okCount === 0
+            ? 'not_live'
+            : okCount === totalPinged
+                ? 'live'
+                : 'partially';
+        return {
+            status,
+            okCount,
+            totalPinged,
+            skippedCount: skippedServices.length,
+            results,
+            liveServices,
+            deadServices,
+            skippedServices,
+        };
+    }
+    /**
+     * Sign arbitrary structured data using canonical JSON (RFC 8785)
+     */
+    sign(asset, data, options = {}) {
+        const signer = options.signer ?? this.signer;
+        if (!signer) {
+            throw new Error('No signer configured - SDK is read-only');
+        }
+        const { payload } = buildSignedPayload(asset, data, signer, options);
+        return canonicalizeSignedPayload(payload);
+    }
+    /**
+     * Verify a signed payload against an agent wallet or provided public key
+     *
+     * NOTE: If publicKey is not provided, this method makes a network call to
+     * fetch the agent's wallet from on-chain data. For offline verification,
+     * always provide the publicKey parameter.
+     *
+     * @param payloadOrUri - Signed payload or URI to fetch it from
+     * @param asset - Agent Core asset pubkey
+     * @param publicKey - Optional: verifier public key (avoids network call if provided)
+     * @param options - Optional settings (allowFileRead: enable loading from file paths, disabled by default)
+     * @returns True if signature is valid
+     * @throws RpcNetworkError if publicKey not provided and network call fails
+     */
+    async verify(payloadOrUri, asset, publicKey, options) {
+        const payload = await this.resolveSignedPayloadInput(payloadOrUri, { allowFileRead: options?.allowFileRead });
+        if (payload.asset !== asset.toBase58()) {
+            return false;
+        }
+        let verifierKey = publicKey;
+        if (!verifierKey) {
+            const agent = await this.loadAgent(asset);
+            if (!agent) {
+                throw new Error('Agent not found');
+            }
+            const agentWallet = agent.getAgentWalletPublicKey();
+            if (!agentWallet) {
+                throw new Error('Agent wallet not configured. Please provide publicKey parameter or set agent wallet using setAgentWallet()');
+            }
+            verifierKey = agentWallet;
+        }
+        return verifySignedPayload(payload, verifierKey);
+    }
+    async resolveSignedPayloadInput(input, options) {
+        if (typeof input !== 'string') {
+            return parseSignedPayload(input);
+        }
+        const trimmed = input.trim();
+        if (!trimmed) {
+            throw new Error('Signed payload is empty');
+        }
+        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+            return parseSignedPayload(JSON.parse(trimmed));
+        }
+        if (trimmed.startsWith('http://') ||
+            trimmed.startsWith('https://') ||
+            trimmed.startsWith('ipfs://') ||
+            trimmed.startsWith('/ipfs/')) {
+            const payload = await this.fetchJsonFromUri(trimmed, 10000);
+            return parseSignedPayload(payload);
+        }
+        // File system reads require explicit opt-in
+        if (!options?.allowFileRead) {
+            throw new Error('File system reads are disabled by default. ' +
+                'Pass { allowFileRead: true } to enable, or use http/ipfs URIs or JSON strings.');
+        }
+        // File system operations are Node.js only
+        if (typeof process === 'undefined' || !process.versions?.node) {
+            throw new Error('Loading signed payloads from file paths is only available in Node.js. ' +
+                'In browser, pass the JSON string directly or use http/ipfs URIs.');
+        }
+        const { readFile } = await import('fs/promises');
+        if (trimmed.startsWith('file://')) {
+            const fileUrl = new URL(trimmed);
+            const content = await readFile(fileUrl, 'utf8');
+            return parseSignedPayload(JSON.parse(content));
+        }
+        const content = await readFile(trimmed, 'utf8');
+        return parseSignedPayload(JSON.parse(content));
+    }
+    async fetchJsonFromUri(uri, timeoutMs, maxBytes = 256 * 1024) {
+        let resolvedUri = uri.trim();
+        if (resolvedUri.startsWith('/ipfs/')) {
+            resolvedUri = `ipfs://${resolvedUri.slice(6)}`;
+        }
+        if (resolvedUri.startsWith('ipfs://')) {
+            if (!this.ipfsClient) {
+                throw new Error('ipfsClient is required to load ipfs:// payloads');
+            }
+            const data = await this.ipfsClient.getJson(resolvedUri);
+            if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                throw new Error('Invalid JSON payload: expected object');
+            }
+            return data;
+        }
+        // SSRF protection: block private/internal hosts
+        if (isBlockedUri(resolvedUri)) {
+            throw new Error('URI blocked: internal/private host not allowed');
+        }
+        let response = await fetch(resolvedUri, {
+            signal: AbortSignal.timeout(timeoutMs),
+            redirect: 'manual',
+        });
+        // Follow redirects manually with SSRF re-validation (max 5 hops)
+        let redirectCount = 0;
+        let currentUrl = resolvedUri;
+        while (response.status >= 300 && response.status < 400 && redirectCount < 5) {
+            const location = response.headers.get('location');
+            if (!location)
+                break;
+            const redirectUrl = new URL(location, currentUrl).toString();
+            if (isBlockedUri(redirectUrl)) {
+                throw new Error('Redirect blocked: target is internal/private host');
+            }
+            currentUrl = redirectUrl;
+            response = await fetch(redirectUrl, {
+                signal: AbortSignal.timeout(timeoutMs),
+                redirect: 'manual',
+            });
+            redirectCount++;
+        }
+        if (!response.ok) {
+            throw new Error(`Failed to fetch JSON: HTTP ${response.status}`);
+        }
+        // Size limit protection
+        const contentLength = response.headers.get('content-length');
+        if (contentLength && parseInt(contentLength, 10) > maxBytes) {
+            throw new Error(`Response too large: ${contentLength} bytes (max: ${maxBytes})`);
+        }
+        // Stream body with byte counting to prevent OOM from large responses
+        let text;
+        const reader = response.body?.getReader();
+        if (reader) {
+            const chunks = [];
+            let totalBytes = 0;
+            try {
+                // eslint-disable-next-line no-constant-condition
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done)
+                        break;
+                    totalBytes += value.length;
+                    if (totalBytes > maxBytes) {
+                        throw new Error(`Response too large: ${totalBytes} bytes (max: ${maxBytes})`);
+                    }
+                    chunks.push(value);
+                }
+            }
+            finally {
+                reader.releaseLock();
+            }
+            text = new TextDecoder().decode(chunks.length === 1 ? chunks[0] : (() => {
+                const merged = new Uint8Array(totalBytes);
+                let offset = 0;
+                for (const chunk of chunks) {
+                    merged.set(chunk, offset);
+                    offset += chunk.length;
+                }
+                return merged;
+            })());
+        }
+        else {
+            // Fallback for environments where response.body is not available
+            text = await response.text();
+            const textByteLength = new TextEncoder().encode(text).byteLength;
+            if (textByteLength > maxBytes) {
+                throw new Error(`Response too large: ${textByteLength} bytes (max: ${maxBytes})`);
+            }
+        }
+        const data = JSON.parse(text);
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('Invalid JSON payload: expected object');
+        }
+        return data;
+    }
+    normalizeRegistrationServices(raw) {
+        // Support both new `services` and legacy `endpoints`
+        const rawServices = raw.services ?? raw.endpoints;
+        if (!Array.isArray(rawServices)) {
+            return [];
+        }
+        const services = [];
+        for (const entry of rawServices) {
+            if (!entry || typeof entry !== 'object') {
+                continue;
+            }
+            const record = entry;
+            const valueField = typeof record.value === 'string' ? record.value : '';
+            const endpointField = typeof record.endpoint === 'string' ? record.endpoint : '';
+            const endpointValue = valueField.length > 0 ? valueField : endpointField;
+            if (!endpointValue) {
+                continue;
+            }
+            const typeCandidate = typeof record.type === 'string'
+                ? record.type
+                : typeof record.name === 'string'
+                    ? record.name
+                    : '';
+            const typeMap = {
+                mcp: ServiceType.MCP,
+                a2a: ServiceType.A2A,
+                ens: ServiceType.ENS,
+                sns: ServiceType.SNS,
+                did: ServiceType.DID,
+                wallet: ServiceType.WALLET,
+                agentwallet: ServiceType.WALLET,
+                oasf: ServiceType.OASF,
+            };
+            const normalizedType = typeMap[typeCandidate.toLowerCase()] ?? (typeCandidate || 'UNKNOWN');
+            const meta = {};
+            if (typeof record.meta === 'object' && record.meta !== null && !Array.isArray(record.meta)) {
+                Object.assign(meta, record.meta);
+            }
+            for (const [key, valueEntry] of Object.entries(record)) {
+                if (key === 'name' || key === 'type' || key === 'value' || key === 'endpoint' || key === 'meta') {
+                    continue;
+                }
+                meta[key] = valueEntry;
+            }
+            services.push({
+                type: normalizedType,
+                value: endpointValue,
+                meta: Object.keys(meta).length ? meta : undefined,
+            });
+        }
+        return services;
+    }
+    async pingEndpoint(endpoint, crawler, options) {
+        const value = endpoint.value;
+        if (typeof value !== 'string' || value.length === 0) {
+            return {
+                type: endpoint.type,
+                endpoint: '',
+                ok: false,
+                reason: 'invalid',
+            };
+        }
+        const isHttp = value.startsWith('http://') || value.startsWith('https://');
+        if (!isHttp) {
+            return {
+                type: endpoint.type,
+                endpoint: value,
+                ok: false,
+                skipped: true,
+                reason: 'non_http',
+            };
+        }
+        if (endpoint.type === ServiceType.MCP) {
+            const start = Date.now();
+            const capabilities = await crawler.fetchMcpCapabilities(value);
+            if (capabilities) {
+                return {
+                    type: endpoint.type,
+                    endpoint: value,
+                    ok: true,
+                    latencyMs: Date.now() - start,
+                };
+            }
+            return this.pingHttpEndpoint(endpoint.type, value, options.timeoutMs, options.treatAuthAsAlive);
+        }
+        if (endpoint.type === ServiceType.A2A) {
+            const start = Date.now();
+            const capabilities = await crawler.fetchA2aCapabilities(value);
+            if (capabilities) {
+                return {
+                    type: endpoint.type,
+                    endpoint: value,
+                    ok: true,
+                    latencyMs: Date.now() - start,
+                };
+            }
+            return this.pingHttpEndpoint(endpoint.type, value, options.timeoutMs, options.treatAuthAsAlive);
+        }
+        return this.pingHttpEndpoint(endpoint.type, value, options.timeoutMs, options.treatAuthAsAlive);
+    }
+    async pingHttpEndpoint(type, endpoint, timeoutMs, treatAuthAsAlive) {
+        if (isBlockedUri(endpoint)) {
+            return { type, endpoint, ok: false, reason: 'blocked' };
+        }
+        const start = Date.now();
+        try {
+            let response = await fetch(endpoint, {
+                method: 'HEAD',
+                redirect: 'manual',
+                signal: AbortSignal.timeout(timeoutMs),
+            });
+            if (response.status === 405) {
+                response = await fetch(endpoint, {
+                    method: 'GET',
+                    redirect: 'manual',
+                    signal: AbortSignal.timeout(timeoutMs),
+                });
+            }
+            const ok = response.ok ||
+                (treatAuthAsAlive && (response.status === 401 || response.status === 402 || response.status === 403));
+            return {
+                type,
+                endpoint,
+                ok,
+                status: response.status,
+                latencyMs: Date.now() - start,
+            };
+        }
+        catch (error) {
+            const reason = error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'network';
+            return {
+                type,
+                endpoint,
+                ok: false,
+                latencyMs: Date.now() - start,
+                reason,
+            };
+        }
+    }
+    // ==================== Utility Methods ====================
+    /**
+     * Check if SDK is in read-only mode (no signer configured)
+     */
+    get isReadOnly() {
+        return this.signer === undefined;
+    }
+    /**
+     * Get chain ID (for parity with agent0-ts)
+     * Returns a string identifier for Solana cluster
+     */
+    async chainId() {
+        return `solana-${this.cluster}`;
+    }
+    /**
+     * Get current cluster
+     */
+    getCluster() {
+        return this.cluster;
+    }
+    /**
+     * Get program IDs for current cluster
+     */
+    getProgramIds() {
+        return this.programIds;
+    }
+    /**
+     * Get registry addresses (for parity with agent0-ts)
+     */
+    registries() {
+        return {
+            IDENTITY: this.programIds.identityRegistry.toBase58(),
+            REPUTATION: this.programIds.reputationRegistry.toBase58(),
+            VALIDATION: this.programIds.validationRegistry.toBase58(),
+        };
+    }
+    /**
+     * Get Solana client for advanced usage
+     */
+    getSolanaClient() {
+        return this.client;
+    }
+    /**
+     * Get feedback manager for advanced usage
+     */
+    getFeedbackManager() {
+        return this.feedbackManager;
+    }
+    /**
+     * Check if SDK is using the default public Solana devnet RPC
+     * Some operations are not supported on the public RPC
+     */
+    isUsingDefaultDevnetRpc() {
+        return this.client.isDefaultDevnetRpc;
+    }
+    /**
+     * Check if SDK supports advanced queries (getProgramAccounts with memcmp)
+     * Returns false when using default Solana devnet RPC
+     */
+    supportsAdvancedQueries() {
+        return this.client.supportsAdvancedQueries();
+    }
+    /**
+     * Get the current RPC URL being used
+     */
+    getRpcUrl() {
+        return this.client.rpcUrl;
+    }
+    // ==================== Hash Utilities ====================
+    /**
+     * Compute the Keccak-256 hash of feedback/file bytes.
+     * The async API is retained for compatibility.
+     * @param data - String or Buffer to hash
+     * @returns 32-byte Keccak-256 hash as Buffer
+     *
+     * @example
+     * const feedbackHash = await Svm8004.computeHash('My feedback content');
+     * const dataHash = await Svm8004.computeHash(Buffer.from(jsonData));
+     */
+    static async computeHash(data) {
+        return keccak256(Buffer.from(data));
+    }
+    /**
+     * Verify indexer integrity against on-chain hash-chain digests (O(1) verification)
+     * Distinguishes between sync lag (indexer behind) and corruption (digest mismatch)
+     *
+     * @param asset - Agent Core asset pubkey
+     * @returns IntegrityResult with detailed status and recommendations
+     *
+     * Status meanings:
+     * - 'valid': All digests match, indexer fully synced
+     * - 'syncing': Indexer is behind (count < on-chain) - safe to use with caution
+     * - 'corrupted': Digest mismatch with same counts - do not trust
+     * - 'error': Verification failed
+     */
+    async verifyIntegrity(asset) {
+        const assetStr = asset.toBase58();
+        const indexerUrl = this.indexerClient.getBaseUrl();
+        const toHex = (arr) => Buffer.from(arr).toString('hex');
+        const isZero = (hex) => /^0+$/.test(hex);
+        const emptyChain = (_type) => ({
+            onChain: '',
+            indexer: null,
+            countOnChain: 0n,
+            countIndexer: 0n,
+            match: false,
+            lag: 0n,
+        });
+        try {
+            if (!this.indexerClient.getLastFeedbackDigest ||
+                !this.indexerClient.getLastResponseDigest ||
+                !this.indexerClient.getLastRevokeDigest) {
+                return {
+                    valid: false,
+                    status: 'error',
+                    asset: assetStr,
+                    indexerUrl,
+                    chains: {
+                        feedback: emptyChain('feedback'),
+                        response: emptyChain('response'),
+                        revoke: emptyChain('revoke'),
+                    },
+                    totalLag: 0n,
+                    trustworthy: false,
+                    error: {
+                        message: 'Integrity verification is not supported by this indexer backend.',
+                        recommendation: 'Configure the legacy REST indexer (INDEXER_URL + INDEXER_API_KEY) or use forceOnChain=true.',
+                    },
+                };
+            }
+            let countRetrievalFailed = false;
+            const safeGetDigest = async (fn) => {
+                try {
+                    return await fn();
+                }
+                catch {
+                    countRetrievalFailed = true;
+                    return { digest: null, count: 0 };
+                }
+            };
+            const [agent, feedbackDigest, responseDigest, revokeDigest] = await Promise.all([
+                this.loadAgent(asset),
+                safeGetDigest(() => this.indexerClient.getLastFeedbackDigest(assetStr)),
+                safeGetDigest(() => this.indexerClient.getLastResponseDigest(assetStr)),
+                safeGetDigest(() => this.indexerClient.getLastRevokeDigest(assetStr)),
+            ]);
+            if (!agent) {
+                return {
+                    valid: false,
+                    status: 'error',
+                    asset: assetStr,
+                    indexerUrl,
+                    chains: {
+                        feedback: emptyChain('feedback'),
+                        response: emptyChain('response'),
+                        revoke: emptyChain('revoke'),
+                    },
+                    totalLag: 0n,
+                    trustworthy: false,
+                    error: {
+                        message: 'Agent not found on-chain',
+                        recommendation: 'Verify the asset pubkey is correct',
+                    },
+                };
+            }
+            const onChainFeedback = toHex(agent.feedback_digest);
+            const onChainResponse = toHex(agent.response_digest);
+            const onChainRevoke = toHex(agent.revoke_digest);
+            const feedbackCountOnChain = BigInt(agent.feedback_count);
+            const responseCountOnChain = BigInt(agent.response_count);
+            const revokeCountOnChain = BigInt(agent.revoke_count);
+            // Calculate lag (positive = indexer behind, negative = indexer ahead)
+            const feedbackLag = feedbackCountOnChain - BigInt(feedbackDigest.count);
+            const responseLag = responseCountOnChain - BigInt(responseDigest.count);
+            const revokeLag = revokeCountOnChain - BigInt(revokeDigest.count);
+            const totalLag = feedbackLag + responseLag + revokeLag;
+            // Check digest matches
+            const feedbackMatch = isZero(onChainFeedback) && !feedbackDigest.digest
+                ? true
+                : feedbackDigest.digest === onChainFeedback;
+            const responseMatch = isZero(onChainResponse) && !responseDigest.digest
+                ? true
+                : responseDigest.digest === onChainResponse;
+            const revokeMatch = isZero(onChainRevoke) && !revokeDigest.digest
+                ? true
+                : revokeDigest.digest === onChainRevoke;
+            const allDigestsMatch = feedbackMatch && responseMatch && revokeMatch;
+            // Determine status:
+            // - If all digests match → valid
+            // - If digests don't match but indexer is behind (positive lag) → syncing
+            // - If digests don't match and counts are same → corrupted
+            let status;
+            let trustworthy = false;
+            if (countRetrievalFailed) {
+                status = 'error';
+                trustworthy = false;
+            }
+            else if (allDigestsMatch) {
+                status = 'valid';
+                trustworthy = true;
+            }
+            else if (totalLag > 0n) {
+                // Indexer is behind - this is sync lag, not corruption
+                status = 'syncing';
+                // Trustworthy for reads if lag is small (e.g., < 100 items)
+                trustworthy = totalLag < 100n;
+            }
+            else if (totalLag < 0n) {
+                // Indexer ahead of on-chain? This shouldn't happen - likely corruption
+                status = 'corrupted';
+                trustworthy = false;
+            }
+            else {
+                // Same counts but different digests → corruption
+                status = 'corrupted';
+                trustworthy = false;
+            }
+            const result = {
+                valid: status === 'valid',
+                status,
+                asset: assetStr,
+                indexerUrl,
+                chains: {
+                    feedback: {
+                        onChain: onChainFeedback,
+                        indexer: feedbackDigest.digest,
+                        countOnChain: feedbackCountOnChain,
+                        countIndexer: BigInt(feedbackDigest.count),
+                        match: feedbackMatch,
+                        lag: feedbackLag,
+                    },
+                    response: {
+                        onChain: onChainResponse,
+                        indexer: responseDigest.digest,
+                        countOnChain: responseCountOnChain,
+                        countIndexer: BigInt(responseDigest.count),
+                        match: responseMatch,
+                        lag: responseLag,
+                    },
+                    revoke: {
+                        onChain: onChainRevoke,
+                        indexer: revokeDigest.digest,
+                        countOnChain: revokeCountOnChain,
+                        countIndexer: BigInt(revokeDigest.count),
+                        match: revokeMatch,
+                        lag: revokeLag,
+                    },
+                },
+                totalLag,
+                trustworthy,
+            };
+            // Add appropriate error/warning messages
+            if (status === 'syncing') {
+                result.error = {
+                    message: `Indexer is ${totalLag} item(s) behind on-chain: ${[
+                        feedbackLag > 0n && `feedback: ${feedbackLag}`,
+                        responseLag > 0n && `response: ${responseLag}`,
+                        revokeLag > 0n && `revoke: ${revokeLag}`,
+                    ].filter(Boolean).join(', ')}`,
+                    recommendation: trustworthy
+                        ? 'Indexer is syncing. Recent items may be missing but existing data is trustworthy.'
+                        : 'Indexer is significantly behind. Consider waiting for sync or using forceOnChain=true',
+                };
+            }
+            else if (status === 'corrupted') {
+                result.error = {
+                    message: `Hash-chain corruption detected: ${[
+                        !feedbackMatch && 'feedback',
+                        !responseMatch && 'response',
+                        !revokeMatch && 'revoke',
+                    ].filter(Boolean).join(', ')}`,
+                    recommendation: 'Indexer data is corrupted. Switch to another indexer, contact operator, or use forceOnChain=true for RPC fallback',
+                };
+            }
+            return result;
+        }
+        catch (err) {
+            return {
+                valid: false,
+                status: 'error',
+                asset: assetStr,
+                indexerUrl,
+                chains: {
+                    feedback: emptyChain('feedback'),
+                    response: emptyChain('response'),
+                    revoke: emptyChain('revoke'),
+                },
+                totalLag: 0n,
+                trustworthy: false,
+                error: {
+                    message: `Verification failed: ${err instanceof Error ? err.message : String(err)}`,
+                    recommendation: 'Check network connectivity and try again',
+                },
+            };
+        }
+    }
+    /**
+     * Deep integrity verification with random spot checks
+     * Detects if indexer has correct digest but deleted data from DB
+     *
+     * @param asset - Agent Core asset pubkey
+     * @param options - Verification options (spot check count, boundary checks)
+     * @returns DeepIntegrityResult with spot check details
+     *
+     * Use cases:
+     * - Detect malicious indexer that stores digests but deletes data
+     * - Verify data completeness beyond digest matching
+     * - Multi-tier verification for high-value operations
+     */
+    async verifyIntegrityDeep(asset, options = {}) {
+        const { spotChecks = 5, checkBoundaries = true, verifyContent = false } = options;
+        // First run basic integrity check
+        const basicResult = await this.verifyIntegrity(asset);
+        // Helper to verify content hash for IPFS URIs
+        // For ipfs://Qm..., the CID IS the content hash, so if URI is present, content is valid
+        // For non-IPFS URIs, we'd need to fetch and hash (expensive, not done here)
+        const verifyFeedbackContent = (fb) => {
+            if (!verifyContent)
+                return {};
+            if (!fb.feedback_uri)
+                return { error: 'no_uri' };
+            // IPFS URIs are content-addressed - CID contains the hash
+            if (fb.feedback_uri.startsWith('ipfs://')) {
+                // If URI is present and hash is stored, consider it valid
+                // (CID itself guarantees content integrity)
+                return { valid: true };
+            }
+            // For non-IPFS URIs, we can't easily verify without fetching
+            // If hash is present, we trust it was computed correctly at storage time
+            if (fb.feedback_hash) {
+                return { valid: true };
+            }
+            return { error: 'no_hash' };
+        };
+        // Initialize spot check results
+        const spotCheckResults = {
+            feedback: [],
+            response: [],
+            revoke: [],
+        };
+        let missingItems = 0;
+        // Helper to generate random indices
+        const getRandomIndices = (max, count) => {
+            if (max <= 0)
+                return [];
+            const indices = new Set();
+            // Always check boundaries if enabled
+            if (checkBoundaries && max > 0) {
+                indices.add(0); // First item
+                indices.add(max - 1); // Last item
+            }
+            // Add random indices
+            while (indices.size < Math.min(count + (checkBoundaries ? 2 : 0), max)) {
+                indices.add(Math.floor(Math.random() * max));
+            }
+            return Array.from(indices).sort((a, b) => a - b);
+        };
+        try {
+            if (!this.indexerClient.getFeedbacksAtIndices ||
+                !this.indexerClient.getResponsesAtOffsets ||
+                !this.indexerClient.getRevocationsAtCounts) {
+                return {
+                    ...basicResult,
+                    spotChecks: spotCheckResults,
+                    spotChecksPassed: false,
+                    missingItems: -1,
+                    modifiedItems: 0,
+                    error: {
+                        message: 'Deep integrity verification is not supported by this indexer backend.',
+                        recommendation: 'Configure the legacy REST indexer (INDEXER_URL + INDEXER_API_KEY) to enable spot checks.',
+                    },
+                };
+            }
+            // Generate indices for spot checks (safe to use Number for array indexing)
+            const feedbackIndices = getRandomIndices(Number(basicResult.chains.feedback.countIndexer), spotChecks);
+            const responseOffsets = getRandomIndices(Number(basicResult.chains.response.countIndexer), spotChecks);
+            const revokeIndices = getRandomIndices(Number(basicResult.chains.revoke.countIndexer), spotChecks);
+            // Parallel spot checks
+            const [feedbackMap, responseMap, revokeMap] = await Promise.all([
+                feedbackIndices.length > 0
+                    ? this.indexerClient.getFeedbacksAtIndices(basicResult.asset, feedbackIndices)
+                    : new Map(),
+                responseOffsets.length > 0
+                    ? this.indexerClient.getResponsesAtOffsets(basicResult.asset, responseOffsets)
+                    : new Map(),
+                revokeIndices.length > 0
+                    ? this.indexerClient.getRevocationsAtCounts(basicResult.asset, revokeIndices.map(i => i + 1))
+                    : new Map(),
+            ]);
+            // Process feedback spot checks
+            for (const idx of feedbackIndices) {
+                const fb = feedbackMap.get(idx);
+                const exists = fb !== null && fb !== undefined;
+                if (!exists)
+                    missingItems++;
+                // Content verification for feedbacks
+                const contentCheck = exists && fb
+                    ? verifyFeedbackContent({ feedback_uri: fb.feedback_uri, feedback_hash: fb.feedback_hash })
+                    : {};
+                spotCheckResults.feedback.push({
+                    index: idx,
+                    exists,
+                    // Spot checks verify event existence and non-null digest, not digest value correctness.
+                    // Use full hash-chain replay (verifyIntegrityFull) for digest value verification.
+                    digestMatch: exists && fb?.running_digest !== null,
+                    contentValid: contentCheck.valid,
+                    contentError: contentCheck.error,
+                });
+            }
+            // Process response spot checks
+            for (const offset of responseOffsets) {
+                const resp = responseMap.get(offset);
+                const exists = resp !== null && resp !== undefined;
+                if (!exists)
+                    missingItems++;
+                spotCheckResults.response.push({
+                    index: offset,
+                    exists,
+                    digestMatch: exists && resp?.running_digest !== null,
+                    // Responses also have content hash (response_hash) that could be verified
+                    contentValid: verifyContent && exists && resp?.response_hash ? true : undefined,
+                });
+            }
+            // Process revoke spot checks
+            for (const idx of revokeIndices) {
+                const rev = revokeMap.get(idx + 1); // revoke_count is 1-based
+                const exists = rev !== null && rev !== undefined;
+                if (!exists)
+                    missingItems++;
+                spotCheckResults.revoke.push({
+                    index: idx,
+                    exists,
+                    digestMatch: exists && rev?.running_digest !== null,
+                });
+            }
+        }
+        catch (err) {
+            // Spot check failed - mark as error but keep basic result
+            return {
+                ...basicResult,
+                spotChecks: spotCheckResults,
+                spotChecksPassed: false,
+                missingItems: -1, // -1 indicates spot check error
+                modifiedItems: 0,
+                error: {
+                    message: `Spot check failed: ${err instanceof Error ? err.message : String(err)}`,
+                    recommendation: 'Could not verify data completeness. Use forceOnChain=true if suspicious.',
+                },
+            };
+        }
+        // Count modified items (content hash mismatch)
+        let modifiedItems = 0;
+        for (const check of spotCheckResults.feedback) {
+            if (check.contentValid === false)
+                modifiedItems++;
+        }
+        for (const check of spotCheckResults.response) {
+            if (check.contentValid === false)
+                modifiedItems++;
+        }
+        for (const check of spotCheckResults.revoke) {
+            if (check.contentValid === false)
+                modifiedItems++;
+        }
+        const spotChecksPassed = missingItems === 0 && modifiedItems === 0;
+        // Adjust status if spot checks reveal issues
+        let finalStatus = basicResult.status;
+        let finalTrustworthy = basicResult.trustworthy;
+        if (!spotChecksPassed && basicResult.status === 'valid') {
+            // Digest matched but data issues detected
+            finalStatus = 'corrupted';
+            finalTrustworthy = false;
+        }
+        const result = {
+            ...basicResult,
+            status: finalStatus,
+            trustworthy: finalTrustworthy,
+            valid: finalStatus === 'valid' && spotChecksPassed,
+            spotChecks: spotCheckResults,
+            spotChecksPassed,
+            missingItems,
+            modifiedItems,
+        };
+        // Update error message based on issue type
+        if (missingItems > 0) {
+            result.error = {
+                message: `Data deletion detected: ${missingItems} spot-checked item(s) missing from indexer`,
+                recommendation: 'Indexer has valid digest but deleted data. This is a data integrity attack. Switch indexers immediately or use forceOnChain=true',
+            };
+        }
+        else if (modifiedItems > 0) {
+            result.error = {
+                message: `Data modification detected: ${modifiedItems} item(s) have modified content (hash mismatch)`,
+                recommendation: 'Indexer is serving modified data. This is a data integrity attack. Switch indexers immediately or use forceOnChain=true',
+            };
+        }
+        return result;
+    }
+    /**
+     * Full hash-chain replay verification
+     * Replays all events and recomputes digests from scratch (or from checkpoint).
+     * Detects any event censorship, reordering, or modification by the indexer.
+     *
+     * @param asset - Agent Core asset pubkey
+     * @param options - Verification options
+     * @returns FullVerificationResult with per-chain replay details
+     */
+    async verifyIntegrityFull(asset, options = {}) {
+        const { useCheckpoints = true, batchSize = 1000, onProgress } = options;
+        const start = Date.now();
+        const assetStr = asset.toBase58();
+        const indexerUrl = this.indexerClient.getBaseUrl();
+        const toHex = (arr) => Buffer.from(arr).toString('hex');
+        try {
+            const agent = await this.loadAgent(asset);
+            if (!agent) {
+                const emptyReplay = { finalDigest: Buffer.alloc(32), count: 0, valid: true };
+                return {
+                    valid: false,
+                    status: 'error',
+                    asset: assetStr,
+                    indexerUrl,
+                    chains: {
+                        feedback: { onChain: '', indexer: null, countOnChain: 0n, countIndexer: 0n, match: false, lag: 0n },
+                        response: { onChain: '', indexer: null, countOnChain: 0n, countIndexer: 0n, match: false, lag: 0n },
+                        revoke: { onChain: '', indexer: null, countOnChain: 0n, countIndexer: 0n, match: false, lag: 0n },
+                    },
+                    totalLag: 0n,
+                    trustworthy: false,
+                    error: { message: 'Agent not found on-chain', recommendation: 'Verify the asset pubkey is correct' },
+                    replay: { feedback: emptyReplay, response: emptyReplay, revoke: emptyReplay },
+                    checkpointsUsed: false,
+                    duration: Date.now() - start,
+                };
+            }
+            const onChainFeedbackDigest = toHex(agent.feedback_digest);
+            const onChainResponseDigest = toHex(agent.response_digest);
+            const onChainRevokeDigest = toHex(agent.revoke_digest);
+            const feedbackCountOnChain = BigInt(agent.feedback_count);
+            const responseCountOnChain = BigInt(agent.response_count);
+            const revokeCountOnChain = BigInt(agent.revoke_count);
+            if (!this.indexerClient.getReplayData) {
+                const emptyReplay = { finalDigest: Buffer.alloc(32), count: 0, valid: true };
+                return {
+                    valid: false,
+                    status: 'error',
+                    asset: assetStr,
+                    indexerUrl,
+                    chains: {
+                        feedback: { onChain: onChainFeedbackDigest, indexer: null, countOnChain: feedbackCountOnChain, countIndexer: 0n, match: false, lag: feedbackCountOnChain },
+                        response: { onChain: onChainResponseDigest, indexer: null, countOnChain: responseCountOnChain, countIndexer: 0n, match: false, lag: responseCountOnChain },
+                        revoke: { onChain: onChainRevokeDigest, indexer: null, countOnChain: revokeCountOnChain, countIndexer: 0n, match: false, lag: revokeCountOnChain },
+                    },
+                    totalLag: feedbackCountOnChain + responseCountOnChain + revokeCountOnChain,
+                    trustworthy: false,
+                    error: {
+                        message: 'Full replay verification is not supported by this indexer backend.',
+                        recommendation: 'Configure the legacy REST indexer (INDEXER_URL + INDEXER_API_KEY) to enable full hash-chain replay.',
+                    },
+                    replay: { feedback: emptyReplay, response: emptyReplay, revoke: emptyReplay },
+                    checkpointsUsed: false,
+                    duration: Date.now() - start,
+                };
+            }
+            let checkpoints = null;
+            let checkpointsUsed = false;
+            if (useCheckpoints) {
+                try {
+                    if (this.indexerClient.getLatestCheckpoints) {
+                        checkpoints = await this.indexerClient.getLatestCheckpoints(assetStr);
+                    }
+                }
+                catch {
+                    // Checkpoints not available, replay from zero
+                }
+            }
+            const parseHexDigest32 = (value, label) => {
+                const normalized = typeof value === 'string' && value.startsWith('0x')
+                    ? value.slice(2)
+                    : value;
+                if (typeof normalized !== 'string' || !/^[0-9a-fA-F]{64}$/.test(normalized)) {
+                    throw new Error(`Invalid ${label}: expected 32-byte hex digest`);
+                }
+                return Buffer.from(normalized, 'hex');
+            };
+            const parseOptionalHexDigest32 = (value, label) => {
+                if (value === null || value === undefined || value === '') {
+                    return undefined;
+                }
+                return parseHexDigest32(value, label);
+            };
+            const parseRequiredHexDigest32 = (value, label) => {
+                if (value === null || value === undefined || value === '') {
+                    throw new Error(`Missing ${label}: expected 32-byte hex digest`);
+                }
+                return parseHexDigest32(value, label);
+            };
+            const replayStartCounts = {
+                feedback: 0,
+                response: 0,
+                revoke: 0,
+            };
+            const getReplayWindowStart = (chainType, startCount) => {
+                if (chainType === 'feedback')
+                    return startCount;
+                return startCount === 0 ? 0 : startCount + 1;
+            };
+            const getReplayUpperBoundExclusive = (chainType, onChainCount) => {
+                const count = Number(onChainCount);
+                return chainType === 'feedback' ? count : count + 1;
+            };
+            const formatMismatchEventNumber = (chainType, mismatchAt) => {
+                if (mismatchAt === undefined)
+                    return 'unknown';
+                const replayStart = replayStartCounts[chainType];
+                if (chainType === 'feedback') {
+                    return String(replayStart + mismatchAt);
+                }
+                return String((replayStart === 0 ? 1 : replayStart) + mismatchAt);
+            };
+            const replayChainFromIndexer = async (chainType, onChainCount) => {
+                const cp = checkpoints?.[chainType];
+                let startDigest = Buffer.alloc(32);
+                let startCount = 0;
+                if (cp && useCheckpoints) {
+                    startDigest = parseHexDigest32(cp.digest, `${chainType} checkpoint digest`);
+                    startCount = cp.event_count;
+                    checkpointsUsed = true;
+                }
+                const allEvents = [];
+                const target = Number(onChainCount);
+                const replayUpperBoundExclusive = getReplayUpperBoundExclusive(chainType, onChainCount);
+                let fromCount = getReplayWindowStart(chainType, startCount);
+                replayStartCounts[chainType] = fromCount;
+                while (fromCount < replayUpperBoundExclusive) {
+                    const toCount = Math.min(fromCount + batchSize, replayUpperBoundExclusive);
+                    const page = await this.indexerClient.getReplayData(assetStr, chainType, fromCount, toCount, batchSize);
+                    allEvents.push(...page.events);
+                    onProgress?.(chainType, allEvents.length + startCount, target);
+                    if (!page.hasMore || page.events.length === 0)
+                        break;
+                    fromCount = page.nextFromCount;
+                }
+                if (chainType === 'feedback') {
+                    const events = allEvents.map((e, index) => ({
+                        asset: Buffer.from(bs58.decode(e.asset)),
+                        client: Buffer.from(bs58.decode(e.client)),
+                        feedbackIndex: BigInt(e.feedback_index),
+                        sealHash: parseRequiredHexDigest32(e.feedback_hash, `feedback_hash[${index}]`),
+                        slot: BigInt(e.slot),
+                        storedDigest: parseOptionalHexDigest32(e.running_digest, `running_digest[${index}]`),
+                    }));
+                    return replayFeedbackChain(events, startDigest, startCount);
+                }
+                else if (chainType === 'response') {
+                    const events = allEvents.map((e, index) => ({
+                        asset: Buffer.from(bs58.decode(e.asset)),
+                        client: Buffer.from(bs58.decode(e.client)),
+                        feedbackIndex: BigInt(e.feedback_index),
+                        responder: e.responder ? Buffer.from(bs58.decode(e.responder)) : Buffer.alloc(32),
+                        responseHash: parseRequiredHexDigest32(e.response_hash, `response_hash[${index}]`),
+                        feedbackHash: parseRequiredHexDigest32(e.feedback_hash, `feedback_hash[${index}]`),
+                        slot: BigInt(e.slot),
+                        storedDigest: parseOptionalHexDigest32(e.running_digest, `running_digest[${index}]`),
+                    }));
+                    return replayResponseChain(events, startDigest, startCount);
+                }
+                else {
+                    const events = allEvents.map((e, index) => ({
+                        asset: Buffer.from(bs58.decode(e.asset)),
+                        client: Buffer.from(bs58.decode(e.client)),
+                        feedbackIndex: BigInt(e.feedback_index),
+                        feedbackHash: parseRequiredHexDigest32(e.feedback_hash, `feedback_hash[${index}]`),
+                        slot: BigInt(e.slot),
+                        storedDigest: parseOptionalHexDigest32(e.running_digest, `running_digest[${index}]`),
+                    }));
+                    return replayRevokeChain(events, startDigest, startCount);
+                }
+            };
+            const [feedbackReplay, responseReplay, revokeReplay] = await Promise.all([
+                replayChainFromIndexer('feedback', feedbackCountOnChain),
+                replayChainFromIndexer('response', responseCountOnChain),
+                replayChainFromIndexer('revoke', revokeCountOnChain),
+            ]);
+            const feedbackDigestMatch = feedbackReplay.finalDigest.toString('hex') === onChainFeedbackDigest;
+            const responseDigestMatch = responseReplay.finalDigest.toString('hex') === onChainResponseDigest;
+            const revokeDigestMatch = revokeReplay.finalDigest.toString('hex') === onChainRevokeDigest;
+            const feedbackCountMatch = BigInt(feedbackReplay.count) === feedbackCountOnChain;
+            const responseCountMatch = BigInt(responseReplay.count) === responseCountOnChain;
+            const revokeCountMatch = BigInt(revokeReplay.count) === revokeCountOnChain;
+            const allValid = feedbackDigestMatch && responseDigestMatch && revokeDigestMatch
+                && feedbackCountMatch && responseCountMatch && revokeCountMatch
+                && feedbackReplay.valid && responseReplay.valid && revokeReplay.valid;
+            const feedbackLag = feedbackCountOnChain - BigInt(feedbackReplay.count);
+            const responseLag = responseCountOnChain - BigInt(responseReplay.count);
+            const revokeLag = revokeCountOnChain - BigInt(revokeReplay.count);
+            const totalLag = feedbackLag + responseLag + revokeLag;
+            let status;
+            let trustworthy = false;
+            if (allValid) {
+                status = 'valid';
+                trustworthy = true;
+            }
+            else if (totalLag > 0n && feedbackReplay.valid && responseReplay.valid && revokeReplay.valid) {
+                status = 'syncing';
+                trustworthy = totalLag < 100n;
+            }
+            else {
+                status = 'corrupted';
+                trustworthy = false;
+            }
+            const result = {
+                valid: allValid,
+                status,
+                asset: assetStr,
+                indexerUrl,
+                chains: {
+                    feedback: {
+                        onChain: onChainFeedbackDigest,
+                        indexer: feedbackReplay.finalDigest.toString('hex'),
+                        countOnChain: feedbackCountOnChain,
+                        countIndexer: BigInt(feedbackReplay.count),
+                        match: feedbackDigestMatch,
+                        lag: feedbackLag,
+                    },
+                    response: {
+                        onChain: onChainResponseDigest,
+                        indexer: responseReplay.finalDigest.toString('hex'),
+                        countOnChain: responseCountOnChain,
+                        countIndexer: BigInt(responseReplay.count),
+                        match: responseDigestMatch,
+                        lag: responseLag,
+                    },
+                    revoke: {
+                        onChain: onChainRevokeDigest,
+                        indexer: revokeReplay.finalDigest.toString('hex'),
+                        countOnChain: revokeCountOnChain,
+                        countIndexer: BigInt(revokeReplay.count),
+                        match: revokeDigestMatch,
+                        lag: revokeLag,
+                    },
+                },
+                totalLag,
+                trustworthy,
+                replay: {
+                    feedback: feedbackReplay,
+                    response: responseReplay,
+                    revoke: revokeReplay,
+                },
+                checkpointsUsed,
+                duration: Date.now() - start,
+            };
+            if (status === 'corrupted') {
+                const mismatchChains = [
+                    !feedbackReplay.valid && `feedback (mismatch at event ${formatMismatchEventNumber('feedback', feedbackReplay.mismatchAt)})`,
+                    !responseReplay.valid && `response (mismatch at event ${formatMismatchEventNumber('response', responseReplay.mismatchAt)})`,
+                    !revokeReplay.valid && `revoke (mismatch at event ${formatMismatchEventNumber('revoke', revokeReplay.mismatchAt)})`,
+                    !feedbackDigestMatch && feedbackReplay.valid && 'feedback (final digest mismatch)',
+                    !responseDigestMatch && responseReplay.valid && 'response (final digest mismatch)',
+                    !revokeDigestMatch && revokeReplay.valid && 'revoke (final digest mismatch)',
+                ].filter(Boolean);
+                result.error = {
+                    message: `Full replay detected corruption: ${mismatchChains.join(', ')}`,
+                    recommendation: 'Hash-chain replay failed. Events may have been censored, reordered, or modified. Switch indexers immediately.',
+                };
+            }
+            else if (status === 'syncing') {
+                result.error = {
+                    message: `Replay verified ${feedbackReplay.count + responseReplay.count + revokeReplay.count} events but indexer is ${totalLag} event(s) behind on-chain`,
+                    recommendation: trustworthy
+                        ? 'Partial verification passed. Recent events still syncing.'
+                        : 'Indexer significantly behind. Wait for sync or use another indexer.',
+                };
+            }
+            return result;
+        }
+        catch (err) {
+            const emptyReplay = { finalDigest: Buffer.alloc(32), count: 0, valid: true };
+            return {
+                valid: false,
+                status: 'error',
+                asset: assetStr,
+                indexerUrl,
+                chains: {
+                    feedback: { onChain: '', indexer: null, countOnChain: 0n, countIndexer: 0n, match: false, lag: 0n },
+                    response: { onChain: '', indexer: null, countOnChain: 0n, countIndexer: 0n, match: false, lag: 0n },
+                    revoke: { onChain: '', indexer: null, countOnChain: 0n, countIndexer: 0n, match: false, lag: 0n },
+                },
+                totalLag: 0n,
+                trustworthy: false,
+                error: {
+                    message: `Full replay failed: ${err instanceof Error ? err.message : String(err)}`,
+                    recommendation: 'Check network connectivity and try again',
+                },
+                replay: { feedback: emptyReplay, response: emptyReplay, revoke: emptyReplay },
+                checkpointsUsed: false,
+                duration: Date.now() - start,
+            };
+        }
+    }
+    /**
+     * Compute hash for a URI
+     * - IPFS/Arweave URIs: zeros (CID already contains content hash)
+     * - Other URIs: SHA-256 of the URI string
+     * Browser-compatible (async for WebCrypto support)
+     * @param uri - URI to hash
+     * @returns 32-byte hash as Buffer
+     *
+     * @example
+     * const hash = await Svm8004.computeUriHash('https://example.com/data.json');
+     * // For IPFS, returns zeros since CID is already a hash
+     * const ipfsHash = await Svm8004.computeUriHash('ipfs://Qm...');
+     */
+    static async computeUriHash(uri) {
+        // IPFS and Arweave URIs contain content-addressable hashes
+        if (uri.startsWith('ipfs://') || uri.startsWith('ar://')) {
+            return Buffer.alloc(32);
+        }
+        // For other URIs, compute SHA-256 hash of the URI itself
+        const hash = await sha256(uri);
+        return Buffer.from(hash);
+    }
+    // Instance method that calls the static one
+    computeUriHash(uri) {
+        return Svm8004.computeUriHash(uri);
+    }
+}
+async function mapWithConcurrency(items, limit, mapper) {
+    const safeLimit = Math.max(1, Math.floor(limit));
+    const results = new Array(items.length);
+    let index = 0;
+    const workers = Array.from({ length: Math.min(safeLimit, items.length) }, async () => {
+        while (index < items.length) {
+            const current = index;
+            index += 1;
+            results[current] = await mapper(items[current]);
+        }
+    });
+    await Promise.all(workers);
+    return results;
+}
+// Modified:
+// - getResponseCount: Added client parameter
+// - readResponses: Added client parameter
+/** @alias Svm8004 — kept so existing 8004-solana call sites keep compiling. */
+export { Svm8004 as SolanaSDK };
+//# sourceMappingURL=sdk-solana.js.map

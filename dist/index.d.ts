@@ -1,0 +1,52 @@
+/**
+ * @musebook/svm-8004
+ * TypeScript SDK for 8004 agent identity, reputation, and ProofPass on Solana.
+ * A Musebook rewrite of 8004-solana 0.8.5, with Solana Agent Kit integration.
+ *
+ * Default cluster is devnet. The Solana Agent Kit plugin lives at
+ * `@musebook/svm-8004/plugin`.
+ */
+export * from './models/index.js';
+export * from './utils/index.js';
+export { IPFSClient } from './core/ipfs-client.js';
+export type { IPFSClientConfig } from './core/ipfs-client.js';
+export { EndpointCrawler } from './core/endpoint-crawler.js';
+export type { McpCapabilities, A2aCapabilities } from './core/endpoint-crawler.js';
+export * from './core/programs.js';
+export * from './core/pda-helpers.js';
+export * from './core/borsh-schemas.js';
+export * from './core/feedback-normalizer.js';
+export * from './core/instruction-discriminators.js';
+export * from './core/instruction-builder.js';
+export * from './core/metaplex-helpers.js';
+export * from './core/transaction-builder.js';
+export { openProofPass, giveFeedbackWithProof, closeProofPass, getLiveProofPass, getLiveProofPassesByCreator, } from './extras/proofpass.js';
+export type { OpenProofPassParams, ProofPassFlow, GiveFeedbackWithProofParams, CloseProofPassParams, CloseProofPassResult, GetLiveProofPassParams, GetLiveProofPassesByCreatorParams, ProofPassLive, ProofPassLiveStatus, } from './extras/proofpass.js';
+export { SolanaClient, UnsupportedRpcError, RpcNetworkError, SOLANA_DEVNET_RPC, SOLANA_TESTNET_RPC, SOLANA_MAINNET_RPC, SOLANA_LOCALNET_RPC, RECOMMENDED_RPC_PROVIDERS, createDevnetClient, } from './core/client.js';
+export type { Cluster, SolanaClientConfig } from './core/client.js';
+export { Svm8004, SolanaSDK } from './core/sdk-solana.js';
+export type { SolanaSDKConfig, SolanaSDKConfig as Svm8004Config, AgentWithMetadata, EnrichedSummary, CollectionInfo, SetCollectionPointerOptions, SetParentAssetOptions, RevokeFeedbackOptions, CreateCollectionUploadOptions, CreateCollectionUploadResult, IntegrityResult, IntegrityStatus, IntegrityChainResult, DeepIntegrityOptions, DeepIntegrityResult, SpotCheckResult, FullVerificationOptions, FullVerificationResult, } from './core/sdk-solana.js';
+export type { SolanaFeedback, SolanaAgentSummary } from './core/feedback-manager-solana.js';
+export { validateSkill, validateDomain, getAllSkills, getAllDomains, } from './core/oasf-validator.js';
+export { computeSealHash, computeFeedbackLeafV1, verifySealHash, createSealParams, validateSealInputs, MAX_TAG_LEN, MAX_ENDPOINT_LEN, MAX_URI_LEN, } from './core/seal.js';
+export type { SealParams } from './core/seal.js';
+export { fetchRegistryConfig, fetchRegistryConfigByPda, getBaseRegistryPda, getBaseCollection, } from './core/config-reader.js';
+export { AtomStats, AtomConfig, TrustTier, ATOM_STATS_SCHEMA, ATOM_CONFIG_SCHEMA, trustTierToString, } from './core/atom-schemas.js';
+export { getAtomConfigPDA, getAtomStatsPDA, } from './core/atom-pda.js';
+export { IndexerClient } from './core/indexer-client.js';
+export { IndexerGraphQLClient } from './core/indexer-graphql-client.js';
+export type { IndexerClientConfig, IndexerReadClient, AgentQueryOptions, IndexedAgent, IndexedFeedback, IndexedAgentReputation, IndexedMetadata, IndexedValidation, IndexedFeedbackResponse, CollectionPointerQueryOptions, CollectionAssetsQueryOptions, CollectionPointerRecord, CollectionStats, GlobalStats, ReplayEventData, ReplayDataPage, CheckpointData, CheckpointSet, ServerReplayResult, } from './core/indexer-client.js';
+export { IndexerError, IndexerErrorCode, IndexerUnavailableError, IndexerTimeoutError, IndexerRateLimitError, IndexerUnauthorizedError, } from './core/indexer-errors.js';
+export type { AgentSearchParams, FeedbackSearchParams, ExtendedAgentSummary, } from './core/indexer-types.js';
+export { indexedAgentToSimplified, indexedFeedbackToSolanaFeedback, indexedReputationToSummary, indexedReputationToExtendedSummary, } from './core/indexer-types.js';
+export { DEFAULT_INDEXER_URL, DEFAULT_INDEXER_API_KEY, DEFAULT_INDEXER_GRAPHQL_URL, getDefaultIndexerUrl, getDefaultIndexerUrls, getDefaultIndexerApiKey, getDefaultIndexerGraphqlUrl, getDefaultIndexerGraphqlUrls, DEFAULT_FORCE_ON_CHAIN, SMALL_QUERY_OPERATIONS, } from './core/indexer-defaults.js';
+export { chainHash, computeResponseLeaf, computeRevokeLeaf, replayFeedbackChain, replayResponseChain, replayRevokeChain, DOMAIN_FEEDBACK, DOMAIN_RESPONSE, DOMAIN_REVOKE, DOMAIN_SEAL_V1, DOMAIN_LEAF_V1, } from './core/hash-chain-replay.js';
+export type { ReplayResult, FeedbackReplayEvent, ResponseReplayEvent, RevokeReplayEvent, } from './core/hash-chain-replay.js';
+export { DEFAULT_CLUSTER, DEFAULT_INDEXER_PRESET } from './core/defaults.js';
+export type { IndexerPreset } from './core/defaults.js';
+export { DEFAULT_AGENT_REGISTRY_PROGRAM_ID, DEFAULT_ATOM_ENGINE_PROGRAM_ID, } from './core/programs.js';
+export { QUANTULABS_PUBLIC_INDEXERS, MUSEBOOK_DIRECTORY, resolveIndexerPreset, } from './core/indexer-defaults.js';
+export { DisabledIndexerClient, INDEXER_NOT_CONFIGURED_MESSAGE } from './core/indexer-disabled.js';
+export { musebookDiscoveryConfig, toMusebookRegistrationDocument, fromMusebookRegistrationDocument, directoryRecordAssetId, MUSEBOOK_REGISTRATION_TYPE, MUSEBOOK_HUB, MUSEBOOK_REGISTRY, } from './integrations/musebook.js';
+export type { MusebookRegistrationDocument, MusebookRegistrationService, } from './integrations/musebook.js';
+//# sourceMappingURL=index.d.ts.map

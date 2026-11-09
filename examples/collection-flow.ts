@@ -1,0 +1,240 @@
+/**
+ * Collection Flow Example (simple metadata + 20 assets)
+ *
+ * Flow:
+ * 1) Create one collection metadata document.
+ * 2) Create 20 distinct agent metadata files.
+ * 3) Register most assets with `collectionPointer` directly in `registerAgent(...)`.
+ * 4) Demonstrate explicit `setCollectionPointer(...)` flow on the first asset.
+ *
+ * Defaults:
+ * - AGENT_COUNT=20
+ * - DRY_RUN=0 (set DRY_RUN=1 to prepare transactions with skipSend)
+ */
+import { Keypair } from '@solana/web3.js';
+import {
+  SolanaSDK,
+  IPFSClient,
+  buildRegistrationFileJson,
+  ServiceType,
+} from '../src/index.js';
+import type {
+  CollectionMetadataInput,
+  RegistrationFile,
+  TransactionResult,
+  PreparedTransaction,
+} from '../src/index.js';
+
+const DEFAULT_AGENT_COUNT = 20;
+const DEFAULT_DRY_COLLECTION_POINTER = 'c1:dryruncollectionflow000000000000000000000001';
+const RPC_URL = 'https://api.devnet.solana.com';
+const SOLANA_PRIVATE_KEY_JSON = '';
+const PINATA_JWT = '';
+const IPFS_API_URL = '';
+const DRY_RUN = true;
+const AGENT_COUNT = 20;
+const DRY_RUN_UPLOAD_COLLECTION = false;
+const DRY_COLLECTION_POINTER = DEFAULT_DRY_COLLECTION_POINTER;
+
+function parseKeypair(secretKey: string): Keypair {
+  return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(secretKey)));
+}
+
+function buildIpfsClient(): IPFSClient | undefined {
+  if (PINATA_JWT) {
+    return new IPFSClient({
+      pinataEnabled: true,
+      pinataJwt: PINATA_JWT,
+    });
+  }
+
+  if (IPFS_API_URL) {
+    return new IPFSClient({ url: IPFS_API_URL });
+  }
+
+  return undefined;
+}
+
+function buildAgentRegistration(index: number): RegistrationFile {
+  const padded = String(index).padStart(2, '0');
+
+  return {
+    name: `CasterCorp Agent ${padded}`,
+    description: `CasterCorp autonomous worker #${padded} for the collection-flow example.`,
+    image: `ipfs://bafybeiexampleagentimages/agent-${padded}.png`,
+    services: [
+      {
+        type: ServiceType.MCP,
+        value: `https://api.castercorp.ai/agent-${padded}/mcp`,
+      },
+      {
+        type: ServiceType.A2A,
+        value: `https://api.castercorp.ai/agent-${padded}/a2a`,
+      },
+      {
+        type: ServiceType.OASF,
+        value: `https://api.castercorp.ai/agent-${padded}/oasf`,
+      },
+    ],
+    skills: ['natural_language_processing/natural_language_generation/summarization'],
+    domains: ['technology/automation/workflow_automation'],
+    active: true,
+    x402Support: index % 2 === 0,
+    metadata: {
+      example: 'collection-flow',
+      ordinal: index,
+    },
+  };
+}
+
+function describeResult(result: unknown): string {
+  if (typeof result !== 'object' || result === null) {
+    return 'unknown result';
+  }
+
+  if ('transaction' in result && typeof result.transaction === 'string') {
+    return `prepared tx (${result.transaction.slice(0, 18)}...)`;
+  }
+
+  if ('signature' in result && typeof result.signature === 'string') {
+    return `signature ${result.signature}`;
+  }
+
+  return 'result without signature/transaction';
+}
+
+async function main() {
+  const dryRun = DRY_RUN;
+  const agentCount = AGENT_COUNT ?? DEFAULT_AGENT_COUNT;
+  if (!Number.isInteger(agentCount) || agentCount <= 0) {
+    throw new Error('AGENT_COUNT must be a positive integer');
+  }
+
+  if (!SOLANA_PRIVATE_KEY_JSON && !dryRun) {
+    throw new Error('SOLANA_PRIVATE_KEY_JSON is required when DRY_RUN is not enabled');
+  }
+
+  const signer = SOLANA_PRIVATE_KEY_JSON ? parseKeypair(SOLANA_PRIVATE_KEY_JSON) : Keypair.generate();
+  if (!SOLANA_PRIVATE_KEY_JSON && dryRun) {
+    console.log('DRY_RUN enabled without SOLANA_PRIVATE_KEY_JSON: using ephemeral signer public key');
+  }
+
+  const ipfsClient = buildIpfsClient();
+  const sdk = new SolanaSDK({
+    signer,
+    rpcUrl: RPC_URL,
+    ...(ipfsClient ? { ipfsClient } : {}),
+  });
+
+  // Keep collection metadata intentionally simple, similar to quickstart docs.
+  const collectionMetadata: CollectionMetadataInput = {
+    name: 'Musebook Agent Fleet',
+    symbol: 'QLFLEET',
+    description: 'Collection metadata for example svm-8004 agents.',
+    image: 'ipfs://bafybeiquantucollection/logo.png',
+  };
+
+  const uploadCollectionToIpfs = !!ipfsClient && (!dryRun || DRY_RUN_UPLOAD_COLLECTION);
+  const collection = await sdk.createCollection(collectionMetadata, {
+    uploadToIpfs: uploadCollectionToIpfs,
+  });
+
+  const collectionPointer =
+    collection.pointer ??
+    DRY_COLLECTION_POINTER ??
+    DEFAULT_DRY_COLLECTION_POINTER;
+
+  if (!collection.pointer && !dryRun) {
+    throw new Error('Collection pointer missing. Configure PINATA_JWT or IPFS_API_URL to upload collection metadata.');
+  }
+
+  console.log('\nCollection prepared:');
+  console.log(`- Name: ${collection.metadata.name}`);
+  console.log(`- CID: ${collection.cid ?? '(not uploaded)'}`);
+  console.log(`- URI: ${collection.uri ?? '(not uploaded)'}`);
+  console.log(`- Pointer used for association: ${collectionPointer}`);
+  console.log(`- Mode: ${dryRun ? 'DRY_RUN (skipSend)' : 'LIVE send'}\n`);
+
+  const createdAssets: string[] = [];
+
+  for (let i = 1; i <= agentCount; i++) {
+    const agentMetadata = buildRegistrationFileJson(buildAgentRegistration(i));
+    let agentUri: string;
+
+    if (dryRun) {
+      agentUri = `ipfs://dry-run-agent-${String(i).padStart(2, '0')}`;
+    } else {
+      if (!ipfsClient) {
+        throw new Error('PINATA_JWT or IPFS_API_URL is required to upload agent metadata in non-dry mode');
+      }
+      const cid = await ipfsClient.addJson(agentMetadata);
+      agentUri = `ipfs://${cid}`;
+    }
+
+    const shouldRunExplicitSetPointer = i === 1;
+    const shouldSetPointerInline = !shouldRunExplicitSetPointer;
+    const registerOptions = dryRun
+      ? {
+          skipSend: true,
+          signer: signer.publicKey,
+          assetPubkey: Keypair.generate().publicKey,
+          ...(shouldSetPointerInline
+            ? {
+                collectionPointer,
+                collectionLock: true,
+              }
+            : {}),
+        }
+      : (shouldSetPointerInline
+          ? {
+              collectionPointer,
+              collectionLock: true,
+            }
+          : undefined);
+    const registerResult = await sdk.registerAgent(agentUri, registerOptions);
+
+    if ('success' in registerResult && !registerResult.success) {
+      throw new Error(`registerAgent failed for #${i}: ${registerResult.error ?? 'unknown error'}`);
+    }
+    if (!registerResult.asset) {
+      throw new Error(`registerAgent did not return an asset for #${i}`);
+    }
+
+    let setPointerResult: TransactionResult | PreparedTransaction | undefined;
+    if (shouldRunExplicitSetPointer) {
+      setPointerResult = await sdk.setCollectionPointer(
+        registerResult.asset,
+        collectionPointer,
+        dryRun
+          ? {
+              skipSend: true,
+              signer: signer.publicKey,
+            }
+          : undefined
+      );
+
+      if ('success' in setPointerResult && !setPointerResult.success) {
+        throw new Error(`setCollectionPointer failed for #${i}: ${setPointerResult.error ?? 'unknown error'}`);
+      }
+    }
+
+    const assetBase58 = registerResult.asset.toBase58();
+    createdAssets.push(assetBase58);
+
+    console.log(
+      `[${String(i).padStart(2, '0')}/${String(agentCount).padStart(2, '0')}] ` +
+        `asset=${assetBase58} | register=${describeResult(registerResult)} | ` +
+        (setPointerResult
+          ? `setCollectionPointer=${describeResult(setPointerResult)}`
+          : 'setCollectionPointer=inline-via-registerAgent')
+    );
+  }
+
+  console.log('\nDone.');
+  console.log(`Created/Prepared ${createdAssets.length} assets associated with ${collectionPointer}`);
+}
+
+main().catch((error) => {
+  console.error('collection-flow failed:', error);
+  process.exit(1);
+});

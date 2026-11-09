@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://8004.dev/schemas/collection-metadata.json",
+  "title": "8004 Collection CID Document v1 (SDK)",
+  "description": "JSON schema for collection metadata URI (IPFS collection document v1 + legacy SDK fields).",
+  "type": "object",
+  "required": ["version", "name"],
+  "additionalProperties": true,
+  "maxProperties": 24,
+  "allOf": [
+    {
+      "not": {
+        "required": ["parent"]
+      }
+    }
+  ],
+  "properties": {
+    "version": {
+      "const": "1.0.0",
+      "description": "Schema profile version for this collection document."
+    },
+    "name": {
+      "type": "string",
+      "description": "Collection display name",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "symbol": {
+      "type": "string",
+      "description": "Collection symbol",
+      "maxLength": 16
+    },
+    "description": {
+      "type": "string",
+      "description": "Collection description",
+      "maxLength": 4096
+    },
+    "image": {
+      "$ref": "#/$defs/uriLike",
+      "description": "Collection logo/image URL (IPFS, Arweave, or HTTPS)"
+    },
+    "banner_image": {
+      "$ref": "#/$defs/uriLike",
+      "description": "Collection banner image URL"
+    },
+    "socials": {
+      "$ref": "#/$defs/socials",
+      "description": "Top-level collection socials"
+    },
+    "external_url": {
+      "$ref": "#/$defs/uriLike",
+      "description": "Legacy SDK website or documentation URL"
+    },
+    "project": {
+      "type": "object",
+      "description": "Legacy SDK project info",
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Project name"
+        },
+        "socials": {
+          "$ref": "#/$defs/socials",
+          "description": "Legacy project socials"
+        }
+      }
+    },
+    "category": {
+      "type": "string",
+      "description": "Legacy SDK category",
+      "enum": [
+        "assistant",
+        "coding",
+        "data-analysis",
+        "creative",
+        "research",
+        "automation",
+        "finance",
+        "healthcare",
+        "education",
+        "gaming",
+        "other"
+      ]
+    },
+    "tags": {
+      "type": "array",
+      "description": "Legacy SDK tags",
+      "items": {
+        "type": "string",
+        "maxLength": 32
+      },
+      "maxItems": 10
+    },
+    "attributes": {
+      "type": "array",
+      "description": "Legacy SDK custom attributes",
+      "items": {
+        "type": "object",
+        "properties": {
+          "trait_type": {
+            "type": "string"
+          },
+          "value": {
+            "type": ["string", "number", "boolean"]
+          }
+        },
+        "required": ["trait_type", "value"]
+      }
+    }
+  },
+  "$defs": {
+    "uriLike": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32768
+    },
+    "socialValue": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "socials": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/socialValue"
+      },
+      "maxProperties": 20,
+      "properties": {
+        "website": {
+          "$ref": "#/$defs/uriLike"
+        },
+        "x": {
+          "$ref": "#/$defs/socialValue"
+        },
+        "twitter": {
+          "$ref": "#/$defs/socialValue"
+        },
+        "discord": {
+          "$ref": "#/$defs/socialValue"
+        },
+        "telegram": {
+          "$ref": "#/$defs/socialValue"
+        },
+        "github": {
+          "$ref": "#/$defs/socialValue"
+        },
+        "farcaster": {
+          "$ref": "#/$defs/socialValue"
+        },
+        "instagram": {
+          "$ref": "#/$defs/socialValue"
+        },
+        "youtube": {
+          "$ref": "#/$defs/socialValue"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,235 @@
+/**
+ * Agent Resolver
+ * v0.3.0 - Asset-based identification
+ *
+ * NOTE: This class is largely deprecated in v0.3.0 since agents are now
+ * identified directly by their Metaplex Core asset pubkey, not by sequential IDs.
+ *
+ * The class is kept for backwards compatibility but most methods are deprecated.
+ * Use the asset pubkey directly instead of resolving from agent_id.
+ */
+
+import { Connection, PublicKey } from '@solana/web3.js';
+import { AgentAccount } from './borsh-schemas.js';
+import { ACCOUNT_DISCRIMINATORS } from './instruction-discriminators.js';
+import { IDENTITY_PROGRAM_ID, PDAHelpers } from './pda-helpers.js';
+import { logger } from '../utils/logger.js';
+import bs58 from 'bs58';
+
+/**
+ * Security: Default limit for getProgramAccounts to prevent OOM
+ * For production with large agent registries, use an indexer instead.
+ */
+const DEFAULT_MAX_ACCOUNTS = 1000;
+
+export interface LoadAgentsOptions {
+  /**
+   * Maximum number of accounts to load (default: 1000)
+   * Security: Prevents OOM from unbounded getProgramAccounts
+   */
+  maxAccounts?: number;
+  /**
+   * If true, throw on malformed accounts instead of skipping
+   * Default: false (skip malformed accounts with warning)
+   */
+  strictParsing?: boolean;
+}
+
+/**
+ * Agent Resolver
+ * v0.3.0 - Validates assets and loads agent accounts
+ *
+ * @deprecated In v0.3.0, agents are identified by their asset pubkey directly.
+ * Use asset pubkeys instead of agent_id numbers.
+ *
+ * Security: Thread-safety protection added in v0.3.0 - cache updates are atomic.
+ */
+export class AgentMintResolver {
+  private assetCache: Map<string, AgentAccount> = new Map();
+  private connection: Connection;
+  private programId: PublicKey;
+  private cacheLoaded: boolean = false;
+  private loadingPromise: Promise<Map<string, AgentAccount>> | null = null;
+
+  constructor(connection: Connection, _collectionMint?: PublicKey, programId: PublicKey = IDENTITY_PROGRAM_ID) {
+    this.connection = connection;
+    this.programId = programId;
+  }
+
+  /**
+   * @deprecated Use asset pubkey directly. In v0.3.0, agents are identified by asset, not agent_id.
+   *
+   * For backwards compatibility, this method now throws an error.
+   * Use getAgentByAsset() instead.
+   */
+  async resolve(_agentId: bigint): Promise<PublicKey> {
+    throw new Error(
+      'AgentMintResolver.resolve() is deprecated in v0.3.0. ' +
+      'Agents are now identified by asset pubkey, not agent_id. ' +
+      'Use asset pubkey directly or getAgentByAsset() to validate an asset.'
+    );
+  }
+
+  /**
+   * Get AgentAccount by asset pubkey - v0.3.0
+   * @param asset - Metaplex Core asset pubkey
+   * @returns AgentAccount or null if not found
+   */
+  async getAgentByAsset(asset: PublicKey): Promise<AgentAccount | null> {
+    const cacheKey = asset.toBase58();
+
+    // Check cache first
+    if (this.assetCache.has(cacheKey)) {
+      return this.assetCache.get(cacheKey)!;
+    }
+
+    // Derive AgentAccount PDA
+    const [agentPda] = PDAHelpers.getAgentPDA(asset, this.programId);
+
+    try {
+      const accountInfo = await this.connection.getAccountInfo(agentPda);
+      if (!accountInfo) {
+        return null;
+      }
+
+      const agentAccount = AgentAccount.deserialize(Buffer.from(accountInfo.data));
+      this.assetCache.set(cacheKey, agentAccount);
+      return agentAccount;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Check if an asset is a registered agent
+   * @param asset - Metaplex Core asset pubkey
+   * @returns true if the asset is a registered agent
+   */
+  async isRegisteredAgent(asset: PublicKey): Promise<boolean> {
+    const agent = await this.getAgentByAsset(asset);
+    return agent !== null;
+  }
+
+  /**
+   * Load all agents from Identity Registry
+   * Security: Limited to maxAccounts (default 1000) to prevent OOM
+   */
+  async loadAllAgents(options: LoadAgentsOptions = {}): Promise<Map<string, AgentAccount>> {
+    if (this.loadingPromise) {
+      return await this.loadingPromise;
+    }
+
+    this.loadingPromise = this.doLoadAllAgents(options);
+    return await this.loadingPromise;
+  }
+
+  private async doLoadAllAgents(options: LoadAgentsOptions): Promise<Map<string, AgentAccount>> {
+    const maxAccounts = options.maxAccounts ?? DEFAULT_MAX_ACCOUNTS;
+    const strictParsing = options.strictParsing ?? false;
+
+    try {
+      const discriminatorBytes = bs58.encode(ACCOUNT_DISCRIMINATORS.AgentAccount);
+
+      const accounts = await this.connection.getProgramAccounts(this.programId, {
+        filters: [
+          {
+            memcmp: {
+              offset: 0,
+              bytes: discriminatorBytes,
+            },
+          },
+        ],
+      });
+
+      // Security: Warn if limit reached - may indicate need for indexer
+      const limitReached = accounts.length > maxAccounts;
+      if (limitReached) {
+        logger.warn(
+          `getProgramAccounts returned ${accounts.length} agents, limiting to ${maxAccounts}. ` +
+          `Consider using an indexer for production.`
+        );
+      }
+
+      // Security: Build in temp map, then atomic swap to prevent race conditions
+      const tempCache = new Map<string, AgentAccount>();
+      let skippedAccounts = 0;
+      const accountsToProcess = accounts.slice(0, maxAccounts);
+
+      for (const { account } of accountsToProcess) {
+        try {
+          const agentAccount = AgentAccount.deserialize(Buffer.from(account.data));
+          const assetPubkey = agentAccount.getAssetPublicKey();
+          tempCache.set(assetPubkey.toBase58(), agentAccount);
+        } catch (parseError) {
+          if (strictParsing) {
+            throw new Error(
+              `Failed to parse AgentAccount: ${parseError instanceof Error ? parseError.message : 'Unknown error'}`
+            );
+          }
+          skippedAccounts++;
+        }
+      }
+
+      // Security: Log warning if accounts were skipped (may indicate corruption)
+      if (skippedAccounts > 0) {
+        logger.warn(
+          `Skipped ${skippedAccounts} malformed AgentAccount(s) during load. ` +
+          `Use strictParsing: true to fail on parse errors.`
+        );
+      }
+
+      // Atomic swap - prevents race condition with concurrent reads
+      this.assetCache = tempCache;
+      this.cacheLoaded = true;
+      this.loadingPromise = null;
+
+      return this.assetCache;
+    } catch (error) {
+      this.loadingPromise = null;
+      // Security: Don't leak internal error details
+      logger.error('Failed to load agents from Identity Registry', error);
+      throw new Error('Failed to load agents from Identity Registry');
+    }
+  }
+
+  /**
+   * @deprecated Use asset pubkey directly. No need to cache agent_id → asset mapping.
+   */
+  addToCache(_agentId: bigint, _mint: PublicKey): void {
+    // No-op in v0.3.0
+  }
+
+  /**
+   * Clear the cache (useful for testing or forcing refresh)
+   */
+  clearCache(): void {
+    this.assetCache.clear();
+    this.cacheLoaded = false;
+    this.loadingPromise = null;
+  }
+
+  /**
+   * Force reload all agents from chain
+   */
+  async refresh(): Promise<void> {
+    this.clearCache();
+    await this.loadAllAgents();
+  }
+
+  /**
+   * @deprecated Use loadAllAgents() instead. Agent IDs no longer exist.
+   */
+  async batchResolve(_agentIds: bigint[]): Promise<Map<bigint, PublicKey>> {
+    throw new Error(
+      'AgentMintResolver.batchResolve() is deprecated in v0.3.0. ' +
+      'Use loadAllAgents() to get all registered agents.'
+    );
+  }
+
+  /**
+   * Get cache size (number of loaded agents)
+   */
+  get size(): number {
+    return this.assetCache.size;
+  }
+}

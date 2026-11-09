@@ -1,0 +1,9 @@
+# Publish allow-list is package.json "files".
+# Keep VCS and build junk out just in case.
+node_modules
+coverage
+.git
+.DS_Store
+*.tgz
+.env
+.env.*

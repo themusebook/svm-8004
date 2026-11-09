@@ -1,0 +1,18 @@
+svm-8004
+========
+
+This package is a Musebook rewrite and rebrand of the 8004-solana
+TypeScript SDK (v0.8.5), originally published by QuantuLabs under the MIT
+License at https://github.com/QuantuLabs/8004-solana-ts
+
+The original copyright notice is preserved in the LICENSE file, as required
+by the MIT License:
+
+    Copyright (c) 2025-2026 QuantuLabs
+
+Musebook additions, restructuring, Solana Agent Kit integration, and
+documentation are copyright (c) 2026 Musebook.
+
+On-chain program IDs for the deployed AgentRegistry8004 and ATOM Engine
+programs are retained so this SDK stays protocol-compatible with existing
+8004 deployments. See docs/PROGRAMS.md.
