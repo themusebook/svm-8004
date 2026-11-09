@@ -10,6 +10,13 @@
  */
 
 import { PublicKey, Keypair } from '@solana/web3.js';
+import {
+  resolveSigner,
+  isSvm8004Signer,
+  isKeypair,
+  type Svm8004Signer,
+  type SignerInput,
+} from './signer.js';
 import bs58 from 'bs58';
 import { SolanaClient, Cluster, UnsupportedRpcError } from './client.js';
 import { SolanaFeedbackManager, SolanaFeedback } from './feedback-manager-solana.js';
@@ -251,8 +258,9 @@ function normalizeCollectionIdInput(collectionId: string | number | bigint): str
 export interface SolanaSDKConfig {
   cluster?: Cluster;
   rpcUrl?: string;
-  // Signer for write operations (optional - read-only if not provided)
-  signer?: Keypair;
+  // Signer for write operations (optional - read-only if not provided).
+  // A raw Keypair is still accepted; wallet-adapter / Solana Agent Kit wallets work too.
+  signer?: SignerInput;
   // Storage configuration
   ipfsClient?: IPFSClient;
   // Indexer configuration — optional. No remote indexer is implied.
@@ -548,7 +556,7 @@ export class Svm8004 {
   private readonly feedbackManager: SolanaFeedbackManager;
   private readonly cluster: Cluster;
   private readonly programIds: ReturnType<typeof getProgramIdsForCluster>;
-  private readonly signer?: Keypair;
+  private readonly signer?: Svm8004Signer;
   private readonly ipfsClient?: IPFSClient;
   private readonly identityTxBuilder: IdentityTransactionBuilder;
   private readonly reputationTxBuilder: ReputationTransactionBuilder;
@@ -565,7 +573,7 @@ export class Svm8004 {
   constructor(config: SolanaSDKConfig = {}) {
     this.cluster = config.cluster || DEFAULT_CLUSTER;
     this.programIds = getProgramIdsForCluster(this.cluster, config.programIds);
-    this.signer = config.signer;
+    this.signer = resolveSigner(config.signer);
     this.ipfsClient = config.ipfsClient;
 
     this.client = new SolanaClient({
@@ -2084,6 +2092,11 @@ export class Svm8004 {
     return this.signer !== undefined;
   }
 
+  /** Configured write signer, if any. */
+  getSigner(): Svm8004Signer | undefined {
+    return this.signer;
+  }
+
   /**
    * Build a collection metadata document that conforms to SDK collection schema.
    * Useful when you want to inspect/edit JSON before upload.
@@ -2469,24 +2482,31 @@ export class Svm8004 {
     };
   }
 
-  /** Set agent wallet - simple version with Keypair (auto-signs) */
-  async setAgentWallet(asset: PublicKey, keypair: Keypair, options?: WriteOptions): Promise<TransactionResult | PreparedTransaction>;
+  /** Set agent wallet - simple version with Keypair or Svm8004Signer (auto-signs via signMessage) */
+  async setAgentWallet(asset: PublicKey, keypair: Keypair | Svm8004Signer, options?: WriteOptions): Promise<TransactionResult | PreparedTransaction>;
   /** Set agent wallet - advanced version with pre-signed signature */
   async setAgentWallet(asset: PublicKey, wallet: PublicKey, signature: Uint8Array, deadline: bigint, options?: WriteOptions): Promise<TransactionResult | PreparedTransaction>;
   async setAgentWallet(
     asset: PublicKey,
-    walletOrKeypair: PublicKey | Keypair,
+    walletOrKeypair: PublicKey | Keypair | Svm8004Signer,
     sigOrOptions?: Uint8Array | WriteOptions,
     deadline?: bigint,
     options?: WriteOptions
   ): Promise<TransactionResult | PreparedTransaction> {
-    // Simple mode: Keypair provided
-    if ('secretKey' in walletOrKeypair) {
-      const keypair = walletOrKeypair;
+    // Simple mode: Keypair or wallet signer (signMessage) provided
+    if (isKeypair(walletOrKeypair) || isSvm8004Signer(walletOrKeypair)) {
+      const walletSigner = isKeypair(walletOrKeypair)
+        ? resolveSigner(walletOrKeypair)!
+        : walletOrKeypair;
       const opts = sigOrOptions as WriteOptions | undefined;
-      const prepared = await this.prepareSetAgentWallet(asset, keypair.publicKey, opts);
-      const nacl = await import('tweetnacl');
-      const sig = nacl.default.sign.detached(prepared.message, keypair.secretKey);
+      const prepared = await this.prepareSetAgentWallet(asset, walletSigner.publicKey, opts);
+      if (!walletSigner.signMessage) {
+        throw new Error(
+          'setAgentWallet in simple mode requires signMessage on the signer. ' +
+            'Pass a pre-signed signature, or use a Keypair / wallet that implements signMessage.',
+        );
+      }
+      const sig = await walletSigner.signMessage(prepared.message);
       return prepared.complete(sig);
     }
 
@@ -2993,8 +3013,14 @@ export class Svm8004 {
    * Sign arbitrary structured data using canonical JSON (RFC 8785)
    */
   sign(asset: PublicKey, data: unknown, options: SignOptions = {}): string {
-    const signer = options.signer ?? this.signer;
+    const signer = options.signer ?? this.signer?.keypair;
     if (!signer) {
+      if (this.signer) {
+        throw new Error(
+          'Svm8004.sign() needs a Keypair. Wallet-adapter signers cannot sign this payload synchronously. ' +
+            'Pass options.signer as a Keypair, or construct the SDK with fromKeypair().',
+        );
+      }
       throw new Error('No signer configured - SDK is read-only');
     }
 

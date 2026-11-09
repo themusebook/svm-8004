@@ -64,6 +64,7 @@ export { chainHash, computeResponseLeaf, computeRevokeLeaf, replayFeedbackChain,
 // ============================================================================
 // svm-8004 defaults and Musebook integration
 // ============================================================================
+export { fromKeypair, fromSolanaAgentKitWallet, fromWalletAdapter, resolveSigner, isSvm8004Signer, isKeypair, } from './core/signer.js';
 export { DEFAULT_CLUSTER, DEFAULT_INDEXER_PRESET } from './core/defaults.js';
 export { DEFAULT_AGENT_REGISTRY_PROGRAM_ID, DEFAULT_ATOM_ENGINE_PROGRAM_ID, } from './core/programs.js';
 export { QUANTULABS_PUBLIC_INDEXERS, MUSEBOOK_DIRECTORY, resolveIndexerPreset, } from './core/indexer-defaults.js';

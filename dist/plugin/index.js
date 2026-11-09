@@ -9,10 +9,10 @@
  *   const withRegistry = agent.use(createSvm8004Plugin({ cluster: 'devnet' }));
  *   const summary = await withRegistry.methods.getReputation({ asset: assetId });
  *
- * Write actions (registerAgent, giveFeedback, setAgentWallet) need a Keypair
- * signer in plugin options. Solana Agent Kit wallets are signers, not
- * exportable Keypairs, so pass `signer` explicitly for writes. Reads work
- * with the agent's RPC connection alone.
+ * Write actions (registerAgent, giveFeedback, setAgentWallet) use
+ * `agent.wallet` (Solana Agent Kit v2 BaseWallet) automatically. You can
+ * still pass an explicit Keypair or Svm8004Signer via `{ signer }` to
+ * override. Reads work with the agent's RPC connection alone.
  *
  * Defaults to devnet. Nothing here sends a transaction until a write
  * action is invoked with a signer.
@@ -21,6 +21,7 @@ import { PublicKey } from '@solana/web3.js';
 import { z } from 'zod';
 import { Svm8004 } from '../core/sdk-solana.js';
 import { DEFAULT_CLUSTER } from '../core/defaults.js';
+import { fromSolanaAgentKitWallet } from '../core/signer.js';
 import { Tag } from '../utils/tags.js';
 function inferCluster(rpcUrl) {
     if (!rpcUrl)
@@ -53,10 +54,12 @@ function jsonSafe(value) {
     return value;
 }
 export function createSdkFromAgent(agent, options = {}) {
+    const signer = options.signer
+        ?? (agent.wallet ? fromSolanaAgentKitWallet(agent.wallet) : undefined);
     return new Svm8004({
         rpcUrl: agent.connection.rpcEndpoint,
         cluster: options.cluster ?? inferCluster(agent.connection.rpcEndpoint),
-        signer: options.signer,
+        signer,
         indexerPreset: options.indexerPreset,
         indexerGraphqlUrl: options.indexerGraphqlUrl,
         indexerUrl: options.indexerUrl,
@@ -64,11 +67,11 @@ export function createSdkFromAgent(agent, options = {}) {
 }
 function requireSigner(sdk, action) {
     if (!sdk.canWrite) {
-        throw new Error(`${action} needs a Keypair signer. Pass one to createSvm8004Plugin({ signer }). ` +
-            'Solana Agent Kit wallets cannot be converted into a Keypair.');
+        throw new Error(`${action} needs a signer. Pass a Keypair or Svm8004Signer to createSvm8004Plugin({ signer }), ` +
+            'or initialize the plugin with a Solana Agent Kit agent that has agent.wallet.');
     }
 }
-function buildMethods(sdk, signer) {
+function buildMethods(sdk) {
     return {
         getSdk: () => sdk,
         getAgent: async ({ asset }) => {
@@ -104,8 +107,9 @@ function buildMethods(sdk, signer) {
         },
         setAgentWallet: async ({ asset }) => {
             requireSigner(sdk, 'setAgentWallet');
+            const signer = sdk.getSigner();
             if (!signer) {
-                throw new Error('setAgentWallet needs the plugin signer Keypair used to construct the SDK.');
+                throw new Error('setAgentWallet needs a configured signer with signMessage support.');
             }
             const result = await sdk.setAgentWallet(new PublicKey(asset), signer);
             return { status: 'success', result: jsonSafe(result) };
@@ -199,7 +203,7 @@ function buildActions(getMethods) {
         {
             name: 'SVM8004_SET_AGENT_WALLET',
             similes: ['set operational wallet', 'bind agent wallet'],
-            description: 'Bind an operational wallet to a registered agent. Uses the plugin Keypair as that wallet.',
+            description: 'Bind an operational wallet to a registered agent. Uses the plugin signer / agent.wallet as that wallet.',
             examples: [
                 [
                     {
@@ -227,7 +231,7 @@ export function createSvm8004Plugin(options = {}) {
         actions: [],
         initialize(agent) {
             const sdk = createSdkFromAgent(agent, options);
-            methods = buildMethods(sdk, options.signer);
+            methods = buildMethods(sdk);
             actions = buildActions(() => {
                 if (!methods)
                     throw new Error('svm-8004 plugin is not initialized');

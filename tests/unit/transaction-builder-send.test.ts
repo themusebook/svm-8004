@@ -10,7 +10,8 @@
  */
 
 import { describe, it, expect, jest, beforeEach } from '@jest/globals';
-import { PublicKey, Connection, Keypair } from '@solana/web3.js';
+import { PublicKey, Connection, Keypair, Transaction } from '@solana/web3.js';
+import { fromWalletAdapter } from '../../src/core/signer.js';
 
 const MOCK_BLOCKHASH = '4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi';
 const MOCK_SIG = '5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQU';
@@ -841,5 +842,38 @@ describe('AtomTransactionBuilder - send mode', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('read-only');
     }
+  });
+});
+
+
+describe('IdentityTransactionBuilder - wallet adapter signer', () => {
+  it('registerAgent partial-signs the generated asset keypair then has the wallet sign', async () => {
+    const conn = createMockConnection();
+    const payer = Keypair.generate();
+    let walletCalls = 0;
+    const wallet = fromWalletAdapter({
+      publicKey: payer.publicKey,
+      signTransaction: async (tx) => {
+        walletCalls += 1;
+        const transaction = tx as Transaction;
+        const extraSigned = transaction.signatures.filter((entry) => entry.signature !== null);
+        expect(extraSigned.length).toBeGreaterThanOrEqual(1);
+        transaction.partialSign(payer);
+        return transaction;
+      },
+    });
+    const builder = new IdentityTransactionBuilder(conn, wallet);
+    const rawSpy = conn.sendRawTransaction as unknown as jest.Mock;
+    rawSpy.mockImplementation(async (raw: Buffer | Uint8Array) => {
+      const sent = Transaction.from(Buffer.from(raw));
+      expect(sent.signatures.filter((entry) => entry.signature).length).toBeGreaterThanOrEqual(2);
+      expect(sent.feePayer?.equals(payer.publicKey)).toBe(true);
+      return MOCK_SIG;
+    });
+
+    const result = await builder.registerAgent('ipfs://test');
+    expect('success' in result && result.success).toBe(true);
+    expect(walletCalls).toBeGreaterThanOrEqual(1);
+    expect(rawSpy).toHaveBeenCalled();
   });
 });

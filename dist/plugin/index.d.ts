@@ -9,26 +9,26 @@
  *   const withRegistry = agent.use(createSvm8004Plugin({ cluster: 'devnet' }));
  *   const summary = await withRegistry.methods.getReputation({ asset: assetId });
  *
- * Write actions (registerAgent, giveFeedback, setAgentWallet) need a Keypair
- * signer in plugin options. Solana Agent Kit wallets are signers, not
- * exportable Keypairs, so pass `signer` explicitly for writes. Reads work
- * with the agent's RPC connection alone.
+ * Write actions (registerAgent, giveFeedback, setAgentWallet) use
+ * `agent.wallet` (Solana Agent Kit v2 BaseWallet) automatically. You can
+ * still pass an explicit Keypair or Svm8004Signer via `{ signer }` to
+ * override. Reads work with the agent's RPC connection alone.
  *
  * Defaults to devnet. Nothing here sends a transaction until a write
  * action is invoked with a signer.
  */
-import { Keypair } from '@solana/web3.js';
 import type { Plugin, SolanaAgentKit } from 'solana-agent-kit';
 import { Svm8004 } from '../core/sdk-solana.js';
 import type { Cluster } from '../core/client.js';
 import { type IndexerPreset } from '../core/defaults.js';
+import { type SignerInput } from '../core/signer.js';
 export interface Svm8004PluginOptions {
     cluster?: Cluster;
     indexerPreset?: IndexerPreset;
     indexerGraphqlUrl?: string;
     indexerUrl?: string;
-    /** Required for write actions. */
-    signer?: Keypair;
+    /** Optional write-signer override (Keypair or Svm8004Signer). Defaults to agent.wallet. */
+    signer?: SignerInput;
 }
 export interface Svm8004PluginMethods {
     getSdk: () => Svm8004;
@@ -54,7 +54,9 @@ export interface Svm8004PluginMethods {
         asset: string;
     }) => Promise<Record<string, unknown>>;
 }
-export declare function createSdkFromAgent(agent: Pick<SolanaAgentKit, 'connection'>, options?: Svm8004PluginOptions): Svm8004;
+export declare function createSdkFromAgent(agent: Pick<SolanaAgentKit, 'connection'> & {
+    wallet?: SolanaAgentKit['wallet'];
+}, options?: Svm8004PluginOptions): Svm8004;
 /**
  * Create a Solana Agent Kit plugin that exposes svm-8004 register, feedback,
  * and reputation actions.

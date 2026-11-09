@@ -25,7 +25,12 @@ existing 8004 accounts stay compatible.
 ### Added
 
 - Solana Agent Kit plugin at `@musebook/svm-8004/plugin` with register,
-  feedback, reputation, and wallet-binding actions.
+  feedback, reputation, and wallet-binding actions. Write actions use
+  `agent.wallet` (no raw Keypair required).
+- `Svm8004Signer` abstraction with `fromKeypair`,
+  `fromSolanaAgentKitWallet`, and `fromWalletAdapter` adapters. Write
+  paths partial-sign locally generated account keypairs, then have the
+  wallet sign.
 - Helpers for `@musebook/identity` registration documents and
   `@musebook/discovery` directory config.
 - `NOTICE` and a dual copyright line (Musebook + QuantuLabs) on the

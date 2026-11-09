@@ -137,7 +137,7 @@ import { SolanaAgentKit } from 'solana-agent-kit';
 import { createSvm8004Plugin } from '@musebook/svm-8004/plugin';
 
 const agent = new SolanaAgentKit(wallet, rpcUrl, config).use(
-  createSvm8004Plugin({ cluster: 'devnet', signer }),
+  createSvm8004Plugin({ cluster: 'devnet' }),
 );
 
 const reputation = await agent.methods.getReputation({ asset: agentAsset });
@@ -146,7 +146,7 @@ const reputation = await agent.methods.getReputation({ asset: agentAsset });
 Actions registered with the kit:
 
 - `SVM8004_GET_AGENT` / `SVM8004_GET_REPUTATION` — reads
-- `SVM8004_REGISTER_AGENT` / `SVM8004_GIVE_FEEDBACK` / `SVM8004_SET_AGENT_WALLET` — writes, need a `Keypair` `signer` in plugin options
+- `SVM8004_REGISTER_AGENT` / `SVM8004_GIVE_FEEDBACK` / `SVM8004_SET_AGENT_WALLET` — writes, signed by `agent.wallet` (or an optional `signer` override: Keypair or `Svm8004Signer`)
 
 ## Musebook Agent Kit helpers
 

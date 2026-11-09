@@ -8,7 +8,8 @@
  * - agent_id removed from all methods, uses asset (Pubkey) for PDA derivation
  * - Multi-collection support via RootConfig
  */
-import { PublicKey, Transaction, Connection, Keypair, TransactionSignature } from '@solana/web3.js';
+import { PublicKey, Transaction, Connection, TransactionSignature } from '@solana/web3.js';
+import { type SignerInput } from './signer.js';
 import { UpdateAtomConfigParams } from './instruction-builder.js';
 import { type ProgramIdOverrides } from './programs.js';
 export type { UpdateAtomConfigParams };
@@ -100,11 +101,11 @@ export declare function serializeTransaction(transaction: Transaction, signer: P
  */
 export declare class IdentityTransactionBuilder {
     private connection;
-    private payer?;
     private instructionBuilder;
     private atomInstructionBuilder;
     private readonly programIds;
-    constructor(connection: Connection, payer?: Keypair | undefined, programIds?: TransactionBuilderProgramIdOverrides);
+    private payer?;
+    constructor(connection: Connection, payer?: SignerInput, programIds?: TransactionBuilderProgramIdOverrides);
     /**
      * Register a new agent (Metaplex Core) - v0.3.0
      * @param agentUri - Optional agent URI
@@ -249,12 +250,12 @@ export declare class IdentityTransactionBuilder {
  */
 export declare class ReputationTransactionBuilder {
     private connection;
-    private payer?;
     private indexerClient?;
     private instructionBuilder;
     private txSalt;
     private readonly programIds;
-    constructor(connection: Connection, payer?: Keypair | undefined, indexerClient?: IndexerReadClient | undefined, programIds?: TransactionBuilderProgramIdOverrides);
+    private payer?;
+    constructor(connection: Connection, payer?: SignerInput, indexerClient?: IndexerReadClient | undefined, programIds?: TransactionBuilderProgramIdOverrides);
     private nextComputeUnitLimit;
     private sendWithRetry;
     /**
@@ -310,9 +311,9 @@ export declare class ReputationTransactionBuilder {
  */
 export declare class ValidationTransactionBuilder {
     private connection;
-    private payer?;
     private readonly programIds;
-    constructor(connection: Connection, payer?: Keypair | undefined, programIds?: TransactionBuilderProgramIdOverrides);
+    private payer?;
+    constructor(connection: Connection, payer?: SignerInput, programIds?: TransactionBuilderProgramIdOverrides);
     /**
      * @deprecated Validation is archived. This compatibility shim always returns an archived error.
      * Request validation for an agent - v0.3.0
@@ -365,10 +366,10 @@ export declare class ValidationTransactionBuilder {
  */
 export declare class AtomTransactionBuilder {
     private connection;
-    private payer?;
     private instructionBuilder;
     private readonly programIds;
-    constructor(connection: Connection, payer?: Keypair | undefined, programIds?: TransactionBuilderProgramIdOverrides);
+    private payer?;
+    constructor(connection: Connection, payer?: SignerInput, programIds?: TransactionBuilderProgramIdOverrides);
     /**
      * Initialize AtomStats for an agent - v0.4.0
      * Must be called by the agent owner before any feedback can be given

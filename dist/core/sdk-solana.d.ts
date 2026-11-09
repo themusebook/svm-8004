@@ -9,6 +9,7 @@
  * - Optional indexer integration for fast queries
  */
 import { PublicKey, Keypair } from '@solana/web3.js';
+import { type Svm8004Signer, type SignerInput } from './signer.js';
 import { SolanaClient, Cluster } from './client.js';
 import { SolanaFeedbackManager, SolanaFeedback } from './feedback-manager-solana.js';
 import type { IPFSClient } from './ipfs-client.js';
@@ -26,7 +27,7 @@ import { type IndexerPreset } from './defaults.js';
 export interface SolanaSDKConfig {
     cluster?: Cluster;
     rpcUrl?: string;
-    signer?: Keypair;
+    signer?: SignerInput;
     ipfsClient?: IPFSClient;
     /** GraphQL v2 endpoint (env INDEXER_GRAPHQL_URL, or a preset) */
     indexerGraphqlUrl?: string;
@@ -742,6 +743,8 @@ export declare class Svm8004 {
      * Check if SDK has write permissions
      */
     get canWrite(): boolean;
+    /** Configured write signer, if any. */
+    getSigner(): Svm8004Signer | undefined;
     /**
      * Build a collection metadata document that conforms to SDK collection schema.
      * Useful when you want to inspect/edit JSON before upload.
@@ -857,8 +860,8 @@ export declare class Svm8004 {
         message: Uint8Array;
         complete: (signature: Uint8Array) => Promise<TransactionResult | PreparedTransaction>;
     }>;
-    /** Set agent wallet - simple version with Keypair (auto-signs) */
-    setAgentWallet(asset: PublicKey, keypair: Keypair, options?: WriteOptions): Promise<TransactionResult | PreparedTransaction>;
+    /** Set agent wallet - simple version with Keypair or Svm8004Signer (auto-signs via signMessage) */
+    setAgentWallet(asset: PublicKey, keypair: Keypair | Svm8004Signer, options?: WriteOptions): Promise<TransactionResult | PreparedTransaction>;
     /** Set agent wallet - advanced version with pre-signed signature */
     setAgentWallet(asset: PublicKey, wallet: PublicKey, signature: Uint8Array, deadline: bigint, options?: WriteOptions): Promise<TransactionResult | PreparedTransaction>;
     /**

@@ -9,6 +9,7 @@
  * - Multi-collection support via RootConfig
  */
 import { PublicKey, Transaction, TransactionInstruction, Keypair, ComputeBudgetProgram, SystemProgram, } from '@solana/web3.js';
+import { resolveSigner, requireSigner, } from './signer.js';
 import { PDAHelpers } from './pda-helpers.js';
 import { sha256 } from '../utils/crypto-utils.js';
 import { writeBigUInt64LE } from '../utils/buffer-utils.js';
@@ -28,17 +29,20 @@ const VALIDATION_ARCHIVED_ERROR = 'Validation feature is archived (v0.5.0+) and 
  * Resends periodically to handle UDP drops. Checks blockhash expiry.
  * Works with any RPC (no WebSocket/signatureSubscribe dependency).
  */
-async function sendAndConfirmTransaction(connection, transaction, signers) {
+async function sendAndConfirmWithSigner(connection, transaction, wallet, extraSigners = []) {
     if (!transaction.recentBlockhash) {
         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
         transaction.recentBlockhash = blockhash;
         transaction.lastValidBlockHeight = lastValidBlockHeight;
     }
     if (!transaction.feePayer) {
-        transaction.feePayer = signers[0].publicKey;
+        transaction.feePayer = wallet.publicKey;
     }
-    transaction.sign(...signers);
-    const rawTx = transaction.serialize();
+    if (extraSigners.length > 0) {
+        transaction.partialSign(...extraSigners);
+    }
+    const signed = await wallet.signTransaction(transaction);
+    const rawTx = signed.serialize();
     const sig = await connection.sendRawTransaction(rawTx, {
         skipPreflight: false,
         preflightCommitment: 'confirmed',
@@ -153,13 +157,13 @@ export function serializeTransaction(transaction, signer, blockhash, lastValidBl
  */
 export class IdentityTransactionBuilder {
     connection;
-    payer;
     instructionBuilder;
     atomInstructionBuilder;
     programIds;
+    payer;
     constructor(connection, payer, programIds) {
         this.connection = connection;
-        this.payer = payer;
+        this.payer = resolveSigner(payer);
         this.programIds = getProgramIds(programIds);
         this.instructionBuilder = new IdentityInstructionBuilder(this.programIds.agentRegistry, this.programIds.mplCore);
         this.atomInstructionBuilder = new AtomInstructionBuilder(this.programIds.atomEngine);
@@ -259,7 +263,7 @@ export class IdentityTransactionBuilder {
             // this can happen when an earlier attempt actually landed after an expiry error.
             let registerSignature;
             try {
-                registerSignature = await this.sendWithRetry(registerTransaction, [this.payer, assetKeypair]);
+                registerSignature = await this.sendWithRetry(registerTransaction, [assetKeypair]);
             }
             catch (error) {
                 const errorMsg = error instanceof Error ? error.message : String(error);
@@ -324,7 +328,7 @@ export class IdentityTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -366,7 +370,7 @@ export class IdentityTransactionBuilder {
                 !options.feePayer.equals(signerPubkey)) {
                 throw new Error('options.feePayer must match signer for setCollectionPointer');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -412,7 +416,7 @@ export class IdentityTransactionBuilder {
                 !options.feePayer.equals(signerPubkey)) {
                 throw new Error('options.feePayer must match signer for setCollectionPointer');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -454,7 +458,7 @@ export class IdentityTransactionBuilder {
                 !options.feePayer.equals(signerPubkey)) {
                 throw new Error('options.feePayer must match signer for setParentAsset');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -500,7 +504,7 @@ export class IdentityTransactionBuilder {
                 !options.feePayer.equals(signerPubkey)) {
                 throw new Error('options.feePayer must match signer for setParentAsset');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -550,7 +554,7 @@ export class IdentityTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -591,7 +595,7 @@ export class IdentityTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -627,7 +631,7 @@ export class IdentityTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -692,7 +696,7 @@ export class IdentityTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -727,7 +731,7 @@ export class IdentityTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -759,7 +763,7 @@ export class IdentityTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -869,7 +873,7 @@ export class IdentityTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const txSignature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const txSignature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature: txSignature, success: true };
         }
         catch (error) {
@@ -917,15 +921,16 @@ export class IdentityTransactionBuilder {
         throw new Error("createBaseCollection removed on-chain in v0.6.0. " +
             "Single-collection architecture: base collection is created during initialize.");
     }
-    async sendWithRetry(transaction, signers, maxRetries = 3) {
+    async sendWithRetry(transaction, extraSigners = [], maxRetries = 3) {
         let lastError = null;
+        const wallet = requireSigner(this.payer);
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
                 transaction.recentBlockhash = blockhash;
                 transaction.lastValidBlockHeight = lastValidBlockHeight;
                 transaction.signatures = [];
-                const signature = await sendAndConfirmTransaction(this.connection, transaction, signers);
+                const signature = await sendAndConfirmWithSigner(this.connection, transaction, wallet, extraSigners);
                 return signature;
             }
             catch (error) {
@@ -955,15 +960,15 @@ export class IdentityTransactionBuilder {
  */
 export class ReputationTransactionBuilder {
     connection;
-    payer;
     indexerClient;
     instructionBuilder;
     txSalt = 0;
     programIds;
+    payer;
     constructor(connection, payer, indexerClient, programIds) {
         this.connection = connection;
-        this.payer = payer;
         this.indexerClient = indexerClient;
+        this.payer = resolveSigner(payer);
         this.programIds = getProgramIds(programIds);
         this.instructionBuilder = new ReputationInstructionBuilder(this.programIds.agentRegistry, this.programIds.atomEngine);
     }
@@ -972,15 +977,16 @@ export class ReputationTransactionBuilder {
         const salt = this.txSalt++ % 32;
         return Math.min(baseUnits + salt, 1_400_000);
     }
-    async sendWithRetry(transaction, signers, maxRetries = 3) {
+    async sendWithRetry(transaction, extraSigners = [], maxRetries = 3) {
         let lastError = null;
+        const wallet = requireSigner(this.payer);
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
                 transaction.recentBlockhash = blockhash;
                 transaction.lastValidBlockHeight = lastValidBlockHeight;
                 transaction.signatures = [];
-                const signature = await sendAndConfirmTransaction(this.connection, transaction, signers);
+                const signature = await sendAndConfirmWithSigner(this.connection, transaction, wallet, extraSigners);
                 return signature;
             }
             catch (error) {
@@ -1067,7 +1073,7 @@ export class ReputationTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await this.sendWithRetry(transaction, [this.payer]);
+            const signature = await this.sendWithRetry(transaction);
             return { signature, success: true, feedbackIndex };
         }
         catch (error) {
@@ -1126,7 +1132,7 @@ export class ReputationTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await this.sendWithRetry(transaction, [this.payer]);
+            const signature = await this.sendWithRetry(transaction);
             return { signature, success: true };
         }
         catch (error) {
@@ -1188,7 +1194,7 @@ export class ReputationTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await this.sendWithRetry(transaction, [this.payer]);
+            const signature = await this.sendWithRetry(transaction);
             return { signature, success: true };
         }
         catch (error) {
@@ -1224,11 +1230,11 @@ export class ReputationTransactionBuilder {
  */
 export class ValidationTransactionBuilder {
     connection;
-    payer;
     programIds;
+    payer;
     constructor(connection, payer, programIds) {
         this.connection = connection;
-        this.payer = payer;
+        this.payer = resolveSigner(payer);
         this.programIds = getProgramIds(programIds);
     }
     /**
@@ -1320,12 +1326,12 @@ export class ValidationTransactionBuilder {
  */
 export class AtomTransactionBuilder {
     connection;
-    payer;
     instructionBuilder;
     programIds;
+    payer;
     constructor(connection, payer, programIds) {
         this.connection = connection;
-        this.payer = payer;
+        this.payer = resolveSigner(payer);
         this.programIds = getProgramIds(programIds);
         this.instructionBuilder = new AtomInstructionBuilder(this.programIds.atomEngine);
     }
@@ -1363,7 +1369,7 @@ export class AtomTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -1400,7 +1406,7 @@ export class AtomTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {
@@ -1434,7 +1440,7 @@ export class AtomTransactionBuilder {
             if (!this.payer) {
                 throw new Error('No signer configured - SDK is read-only');
             }
-            const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+            const signature = await sendAndConfirmWithSigner(this.connection, transaction, requireSigner(this.payer));
             return { signature, success: true };
         }
         catch (error) {

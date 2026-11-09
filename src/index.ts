@@ -240,6 +240,23 @@ export type {
 // svm-8004 defaults and Musebook integration
 // ============================================================================
 
+
+export {
+  fromKeypair,
+  fromSolanaAgentKitWallet,
+  fromWalletAdapter,
+  resolveSigner,
+  isSvm8004Signer,
+  isKeypair,
+} from './core/signer.js';
+export type {
+  Svm8004Signer,
+  SignerInput,
+  SolanaAgentKitWalletLike,
+  WalletAdapterLike,
+  SignableTransaction,
+} from './core/signer.js';
+
 export { DEFAULT_CLUSTER, DEFAULT_INDEXER_PRESET } from './core/defaults.js';
 export type { IndexerPreset } from './core/defaults.js';
 

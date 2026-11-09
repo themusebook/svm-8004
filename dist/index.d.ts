@@ -42,6 +42,8 @@ export { indexedAgentToSimplified, indexedFeedbackToSolanaFeedback, indexedReput
 export { DEFAULT_INDEXER_URL, DEFAULT_INDEXER_API_KEY, DEFAULT_INDEXER_GRAPHQL_URL, getDefaultIndexerUrl, getDefaultIndexerUrls, getDefaultIndexerApiKey, getDefaultIndexerGraphqlUrl, getDefaultIndexerGraphqlUrls, DEFAULT_FORCE_ON_CHAIN, SMALL_QUERY_OPERATIONS, } from './core/indexer-defaults.js';
 export { chainHash, computeResponseLeaf, computeRevokeLeaf, replayFeedbackChain, replayResponseChain, replayRevokeChain, DOMAIN_FEEDBACK, DOMAIN_RESPONSE, DOMAIN_REVOKE, DOMAIN_SEAL_V1, DOMAIN_LEAF_V1, } from './core/hash-chain-replay.js';
 export type { ReplayResult, FeedbackReplayEvent, ResponseReplayEvent, RevokeReplayEvent, } from './core/hash-chain-replay.js';
+export { fromKeypair, fromSolanaAgentKitWallet, fromWalletAdapter, resolveSigner, isSvm8004Signer, isKeypair, } from './core/signer.js';
+export type { Svm8004Signer, SignerInput, SolanaAgentKitWalletLike, WalletAdapterLike, SignableTransaction, } from './core/signer.js';
 export { DEFAULT_CLUSTER, DEFAULT_INDEXER_PRESET } from './core/defaults.js';
 export type { IndexerPreset } from './core/defaults.js';
 export { DEFAULT_AGENT_REGISTRY_PROGRAM_ID, DEFAULT_ATOM_ENGINE_PROGRAM_ID, } from './core/programs.js';
