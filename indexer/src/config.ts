@@ -17,6 +17,7 @@ export interface IndexerConfig {
   host: string;
   port: number;
   pollIntervalMs: number;
+  maxSignaturesPerPoll: number;
   apiKey?: string;
 }
 
@@ -69,7 +70,8 @@ export function loadConfig(overrides: Partial<IndexerConfig> = {}): IndexerConfi
       'sqlite:./data/indexer.db',
     host: overrides.host ?? env('HOST') ?? '0.0.0.0',
     port: overrides.port ?? Number(env('PORT') ?? env('SVM8004_INDEXER_PORT') ?? 3005),
-    pollIntervalMs: overrides.pollIntervalMs ?? Number(env('SVM8004_POLL_INTERVAL_MS') ?? 15_000),
+    pollIntervalMs: overrides.pollIntervalMs ?? Number(env('SVM8004_POLL_INTERVAL_MS') ?? 30_000),
+    maxSignaturesPerPoll: overrides.maxSignaturesPerPoll ?? Number(env('SVM8004_MAX_SIGNATURES_PER_POLL') ?? 40),
     apiKey: overrides.apiKey ?? env('INDEXER_API_KEY') ?? env('SVM8004_INDEXER_API_KEY'),
   };
 }

@@ -12,6 +12,11 @@ import {
 import bs58 from 'bs58';
 import type { IndexerConfig } from './config.js';
 import {
+  TX_READ_CONFIG,
+  type RetryHooks,
+  withRpcRetry,
+} from './rpc.js';
+import {
   decodeAgent,
   decodeAtomStats,
   decodeFeedback,
@@ -49,33 +54,36 @@ async function getProgramAccountsSafe(
   connection: Connection,
   programId: PublicKey,
   discriminator: Buffer,
+  retry?: RetryHooks,
 ): Promise<ReadonlyArray<{ pubkey: PublicKey; account: AccountInfo<Buffer> }>> {
-  let lastError: Error | undefined;
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    try {
-      return await connection.getProgramAccounts(programId, {
-        commitment: 'confirmed',
-        filters: [discFilter(discriminator)],
-      });
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-      if (attempt < 4) {
-        await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
-      }
-    }
+  try {
+    return await withRpcRetry(
+      () =>
+        connection.getProgramAccounts(programId, {
+          commitment: 'confirmed',
+          filters: [discFilter(discriminator)],
+        }),
+      { retries: 4, retry: () => true, ...retry },
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`getProgramAccounts failed for ${programId.toBase58()}: ${message}`);
   }
-  throw new Error(`getProgramAccounts failed for ${programId.toBase58()}: ${lastError?.message}`);
 }
 
 async function chunkedGetMultiple(
   connection: Connection,
   keys: PublicKey[],
   size = 100,
+  retry?: RetryHooks,
 ): Promise<Array<AccountInfo<Buffer> | null>> {
   const out: Array<AccountInfo<Buffer> | null> = [];
   for (let i = 0; i < keys.length; i += size) {
     const slice = keys.slice(i, i + size);
-    const infos = await connection.getMultipleAccountsInfo(slice, 'confirmed');
+    const infos = await withRpcRetry(
+      () => connection.getMultipleAccountsInfo(slice, 'confirmed'),
+      retry,
+    );
     out.push(...infos);
   }
   return out;
@@ -93,15 +101,19 @@ export class Ingestor {
   };
   private timer?: NodeJS.Timeout;
   private readonly connection: Connection;
+  private readonly retry: RetryHooks;
 
   constructor(
     private readonly store: IndexerStore,
     private readonly config: IndexerConfig,
     connection?: Connection,
+    retry?: RetryHooks,
   ) {
+    this.retry = retry ?? {};
     this.connection = connection ?? new Connection(config.rpcUrl, {
       commitment: 'confirmed',
       wsEndpoint: config.wsUrl,
+      disableRetryOnRateLimit: true,
     });
   }
 
@@ -152,6 +164,7 @@ export class Ingestor {
       this.connection,
       this.config.registryProgramId,
       ACCOUNT_DISCRIMINATORS.AgentAccount,
+      this.retry,
     );
     for (const item of accounts) {
       const row = decodeAgent(Buffer.from(item.account.data));
@@ -164,6 +177,7 @@ export class Ingestor {
       this.connection,
       this.config.registryProgramId,
       ACCOUNT_DISCRIMINATORS.FeedbackAccount,
+      this.retry,
     );
     for (const item of accounts) {
       const row = decodeFeedback(Buffer.from(item.account.data));
@@ -191,6 +205,7 @@ export class Ingestor {
       this.connection,
       this.config.registryProgramId,
       ACCOUNT_DISCRIMINATORS.MetadataEntryPda,
+      this.retry,
     );
     for (const item of accounts) {
       const row = decodeMetadata(Buffer.from(item.account.data));
@@ -203,6 +218,7 @@ export class Ingestor {
       this.connection,
       this.config.atomProgramId,
       ACCOUNT_DISCRIMINATORS.AtomStats,
+      this.retry,
     );
     const agents = await this.store.all('agents');
     const byAsset = new Map(agents.map((row) => [String(row.asset), row]));
@@ -238,7 +254,7 @@ export class Ingestor {
       tagKeys.push(PDAHelpers.getFeedbackTagsPDA(asset, index, this.config.registryProgramId)[0]);
       indexKeys.push(PDAHelpers.getResponseIndexPDA(asset, index, this.config.registryProgramId)[0]);
     }
-    const tagInfos = await chunkedGetMultiple(this.connection, tagKeys);
+    const tagInfos = await chunkedGetMultiple(this.connection, tagKeys, 100, this.retry);
     for (let i = 0; i < feedbacks.length; i++) {
       const info = tagInfos[i];
       if (!info) continue;
@@ -247,7 +263,7 @@ export class Ingestor {
       await this.store.upsert('feedbacks', { ...feedbacks[i], ...tags }, 'id');
     }
 
-    const indexInfos = await chunkedGetMultiple(this.connection, indexKeys);
+    const indexInfos = await chunkedGetMultiple(this.connection, indexKeys, 100, this.retry);
     const responseKeys: PublicKey[] = [];
     const responseMeta: Array<{ asset: string; client?: string; feedbackIndex: number; responseIndex: number }> = [];
     for (let i = 0; i < feedbacks.length; i++) {
@@ -268,7 +284,7 @@ export class Ingestor {
         });
       }
     }
-    const responseInfos = await chunkedGetMultiple(this.connection, responseKeys);
+    const responseInfos = await chunkedGetMultiple(this.connection, responseKeys, 100, this.retry);
     for (let i = 0; i < responseKeys.length; i++) {
       const info = responseInfos[i];
       if (!info) continue;
@@ -287,10 +303,14 @@ export class Ingestor {
     let cursor: string | undefined;
     // Walk newest-first until we hit the cursor or run out of pages (cap 5 pages).
     for (let page = 0; page < 5; page++) {
-      const batch = await this.connection.getSignaturesForAddress(this.config.registryProgramId, {
-        limit: 200,
-        before: cursor,
-      });
+      const batch = await withRpcRetry(
+        () =>
+          this.connection.getSignaturesForAddress(this.config.registryProgramId, {
+            limit: 200,
+            before: cursor,
+          }),
+        this.retry,
+      );
       if (batch.length === 0) break;
       let hitKnown = false;
       for (const info of batch) {
@@ -305,7 +325,9 @@ export class Ingestor {
     }
     // Process oldest first so the cursor advances correctly.
     sigs.reverse();
-    for (const info of sigs) {
+    const cap = Math.max(1, this.config.maxSignaturesPerPoll);
+    const batch = sigs.slice(0, cap);
+    for (const info of batch) {
       await this.ingestSignature(info);
       await this.store.setCursor('registry:last_signature', info.signature);
       this.status.signaturesProcessed += 1;
@@ -313,10 +335,10 @@ export class Ingestor {
   }
 
   private async ingestSignature(info: ConfirmedSignatureInfo): Promise<void> {
-    const tx = await this.connection.getTransaction(info.signature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: 'confirmed',
-    });
+    const tx = await withRpcRetry(
+      () => this.connection.getTransaction(info.signature, TX_READ_CONFIG),
+      this.retry,
+    );
     if (!tx) return;
     const message = tx.transaction.message as {
       accountKeys?: Array<PublicKey | { pubkey?: PublicKey; toString(): string }>;
@@ -333,7 +355,7 @@ export class Ingestor {
       rawKeys.push(...(tx.meta?.loadedAddresses?.readonly ?? []));
     }
     const pubkeys = rawKeys.map((key) => (key instanceof PublicKey ? key : new PublicKey(key)));
-    const infos = await chunkedGetMultiple(this.connection, pubkeys);
+    const infos = await chunkedGetMultiple(this.connection, pubkeys, 100, this.retry);
     const extras = { slot: tx.slot, signature: info.signature };
     for (const account of infos) {
       if (!account) continue;

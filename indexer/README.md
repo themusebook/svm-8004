@@ -4,9 +4,9 @@ Musebook 8004 indexer. It backfills and polls the deployed Agent Registry
 and ATOM programs (devnet by default) and serves the PostgREST-shaped
 REST v1 API that `@musebook/svm-8004`'s `IndexerClient` already speaks.
 
-The planned public URL is `https://indexer.musebook.trade` (`indexerPreset: 'musebook'`
-in the SDK). That host is **not live yet**. Run this package yourself and
-point the SDK at it with `indexerUrl` or `MUSEBOOK_INDEXER_URL`.
+The public URL is `https://indexer.musebook.trade` (`indexerPreset: 'musebook'`
+in the SDK). You can also point the SDK at a local process with `indexerUrl`
+or `MUSEBOOK_INDEXER_URL`.
 
 GraphQL v2 (`/v2/graphql`) is a follow-up. The SDK prefers GraphQL when a
 URL is configured, but every current `IndexerClient` read works over REST.
@@ -43,7 +43,7 @@ Replay / checkpoint routes return empty stubs for now.
 
 1. `getProgramAccounts` backfill of Agent, Feedback, Metadata, and ATOM stats accounts, decoded with the SDK's own Borsh decoders.
 2. Derived tag and response accounts are fetched via the SDK PDA helpers.
-3. Signature polling (`getSignaturesForAddress` + `getTransaction`) keeps the store current. Websocket logs are optional via `SVM8004_WS_URL` (polling is the default).
+3. Signature polling (`getSignaturesForAddress` + `getTransaction` with `maxSupportedTransactionVersion: 1` for legacy, v0, and v1 transactions) keeps the store current. Rate-limited RPC calls retry with jittered exponential backoff. Websocket logs are optional via `SVM8004_WS_URL` (polling is the default).
 
 Source of truth on devnet:
 
@@ -85,7 +85,8 @@ Or `indexerPreset: 'musebook'` once you set `MUSEBOOK_INDEXER_URL` (or when `htt
 | `SVM8004_ATOM_PROGRAM_ID` | cluster ATOM id |
 | `DATABASE_URL` | `sqlite:./data/indexer.db` |
 | `PORT` | `3005` |
-| `SVM8004_POLL_INTERVAL_MS` | `15000` |
+| `SVM8004_POLL_INTERVAL_MS` | `30000` |
+| `SVM8004_MAX_SIGNATURES_PER_POLL` | `40` |
 | `INDEXER_API_KEY` | unset (open) |
 
 `DATABASE_URL=postgres://...` selects Postgres. SQLite is the default for local use.
@@ -93,8 +94,7 @@ Or `indexerPreset: 'musebook'` once you set `MUSEBOOK_INDEXER_URL` (or when `htt
 ## Docker / Railway / Render
 
 A `Dockerfile`, `railway.toml`, and `render.yaml` live at the repository
-root. They are provided so the service can be deployed later. **This
-package is not deployed from this change.**
+root. The production indexer runs on Railway at `https://indexer.musebook.trade`.
 
 ## License
 
