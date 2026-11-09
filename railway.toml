@@ -1,4 +1,4 @@
-# Config only — do not auto-deploy from this commit.
+# Railway config for @musebook/svm-8004-indexer (devnet, read-only).
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
