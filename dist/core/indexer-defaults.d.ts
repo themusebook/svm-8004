@@ -12,10 +12,15 @@
  * - INDEXER_PRESET: `quantulabs-public` to use upstream public indexers
  * - FORCE_ON_CHAIN: Set to 'true' to bypass the indexer
  *
- * TODO: A Musebook 8004 indexer is not available yet.
- * registry.musebook.trade answers GET /api/health but is a directory UI,
- * not a 8004 REST/GraphQL indexer (no /rest/v1 or /v2/graphql). Use
- * `@musebook/discovery` against musebook.trade for directory search.
+ * The Musebook 8004 indexer lives in this repo as
+ * `@musebook/svm-8004-indexer`. The planned public URL is
+ * https://indexer.musebook.trade (not live yet). Use
+ * `indexerPreset: 'musebook'` or `INDEXER_PRESET=musebook`, and set
+ * `MUSEBOOK_INDEXER_URL` (or INDEXER_URL) to a running instance such as
+ * http://127.0.0.1:3005/rest/v1. GraphQL v2 is a follow-up.
+ *
+ * registry.musebook.trade is still a directory UI, not the 8004 indexer.
+ * Use `@musebook/discovery` against musebook.trade for directory search.
  */
 import type { Cluster } from './client.js';
 import { type IndexerPreset } from './defaults.js';
@@ -25,6 +30,8 @@ export declare const MUSEBOOK_DIRECTORY: {
     readonly registry: "https://registry.musebook.trade";
     readonly health: "https://registry.musebook.trade/api/health";
 };
+/** Planned public Musebook 8004 indexer (not live yet). */
+export declare const MUSEBOOK_INDEXER_HOST = "https://indexer.musebook.trade";
 /**
  * Public QuantuLabs 8004 indexers from the upstream 8004-solana SDK.
  * Protocol-compatible with the deployed AgentRegistry8004 programs.

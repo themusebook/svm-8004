@@ -83,3 +83,13 @@ suivi-sdk.md
 .claude/settings.local.json
 .claude/CLAUDE.md
 artifacts/
+
+# Indexer local databases
+indexer/data/*.db
+indexer/data/*.sqlite
+*.db
+*.sqlite
+
+# Indexer build output (built in CI / Docker)
+indexer/dist/
+indexer/node_modules/

@@ -76,7 +76,10 @@
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build && npm run lint",
     "e2e:indexers:ipfs:start": "node scripts/e2e-indexers-ipfs-start.mjs",
-    "e2e:indexers:ipfs:stop": "node scripts/e2e-indexers-ipfs-stop.mjs"
+    "e2e:indexers:ipfs:stop": "node scripts/e2e-indexers-ipfs-stop.mjs",
+    "build:all": "npm run build && npm run build --workspace=@musebook/svm-8004-indexer",
+    "test:all": "npm test && npm test --workspace=@musebook/svm-8004-indexer",
+    "indexer": "npm run start --workspace=@musebook/svm-8004-indexer"
   },
   "keywords": [
     "solana",
@@ -171,5 +174,8 @@
     "rpc-websockets": {
       "uuid": "9.0.1"
     }
-  }
+  },
+  "workspaces": [
+    "indexer"
+  ]
 }

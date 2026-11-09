@@ -148,6 +148,25 @@ Actions registered with the kit:
 - `SVM8004_GET_AGENT` / `SVM8004_GET_REPUTATION` — reads
 - `SVM8004_REGISTER_AGENT` / `SVM8004_GIVE_FEEDBACK` / `SVM8004_SET_AGENT_WALLET` — writes, signed by `agent.wallet` (or an optional `signer` override: Keypair or `Svm8004Signer`)
 
+## Musebook 8004 indexer
+
+`@musebook/svm-8004-indexer` lives in `indexer/`. It backfills the deployed
+devnet 8004 programs and serves the REST API `IndexerClient` expects.
+
+```bash
+cd indexer && npm start
+```
+
+```typescript
+const sdk = new Svm8004({
+  cluster: 'devnet',
+  indexerUrl: 'http://127.0.0.1:3005/rest/v1',
+  // or: indexerPreset: 'musebook'  // planned https://indexer.musebook.trade (not live yet)
+});
+```
+
+GraphQL v2 is a follow-up. See `indexer/README.md`.
+
 ## Musebook Agent Kit helpers
 
 ```typescript

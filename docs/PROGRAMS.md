@@ -44,15 +44,23 @@ Configuration order:
 
 1. `indexerGraphqlUrl` / `indexerUrl` on the SDK config
 2. `INDEXER_GRAPHQL_URL` / `INDEXER_URL` environment variables
-3. `indexerPreset: 'quantulabs-public'` or `INDEXER_PRESET=quantulabs-public`
+3. `indexerPreset: 'musebook'` / `INDEXER_PRESET=musebook`, or
+   `indexerPreset: 'quantulabs-public'` / `INDEXER_PRESET=quantulabs-public`
 4. localnet defaults to `http://127.0.0.1:3005`
 5. otherwise the SDK runs without an indexer and falls back on-chain
 
-### TODO: Musebook 8004 indexer
+### Musebook 8004 indexer
 
-[registry.musebook.trade](https://registry.musebook.trade) is a **directory
-UI**. `GET /api/health` is healthy, but `/rest/v1` and `/v2/graphql` are
-not 8004 indexer APIs. Directory search belongs to
+This repo now includes `@musebook/svm-8004-indexer` (the `indexer/`
+package). Use `indexerPreset: 'musebook'`. The planned public URL is
+`https://indexer.musebook.trade` — **that host is not live yet**. Point a
+running instance with `MUSEBOOK_INDEXER_URL` or `INDEXER_URL`
+(for example `http://127.0.0.1:3005/rest/v1`).
+
+The indexer speaks the REST v1 shape used by `IndexerClient`. GraphQL v2
+is a follow-up.
+
+[registry.musebook.trade](https://registry.musebook.trade) remains a
+**directory UI**, not the 8004 indexer. Directory search belongs to
 [`@musebook/discovery`](https://www.npmjs.com/package/@musebook/discovery)
-against `https://musebook.trade`. When a Musebook 8004 indexer exists, a
-`musebook` preset will be added here.
+against `https://musebook.trade`.

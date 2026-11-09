@@ -47,7 +47,7 @@ export type { Svm8004Signer, SignerInput, SolanaAgentKitWalletLike, WalletAdapte
 export { DEFAULT_CLUSTER, DEFAULT_INDEXER_PRESET } from './core/defaults.js';
 export type { IndexerPreset } from './core/defaults.js';
 export { DEFAULT_AGENT_REGISTRY_PROGRAM_ID, DEFAULT_ATOM_ENGINE_PROGRAM_ID, } from './core/programs.js';
-export { QUANTULABS_PUBLIC_INDEXERS, MUSEBOOK_DIRECTORY, resolveIndexerPreset, } from './core/indexer-defaults.js';
+export { QUANTULABS_PUBLIC_INDEXERS, MUSEBOOK_DIRECTORY, MUSEBOOK_INDEXER_HOST, resolveIndexerPreset, } from './core/indexer-defaults.js';
 export { DisabledIndexerClient, INDEXER_NOT_CONFIGURED_MESSAGE } from './core/indexer-disabled.js';
 export { musebookDiscoveryConfig, toMusebookRegistrationDocument, fromMusebookRegistrationDocument, directoryRecordAssetId, MUSEBOOK_REGISTRATION_TYPE, MUSEBOOK_HUB, MUSEBOOK_REGISTRY, } from './integrations/musebook.js';
 export type { MusebookRegistrationDocument, MusebookRegistrationService, } from './integrations/musebook.js';

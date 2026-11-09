@@ -1,0 +1,17 @@
+# Config only — do not auto-deploy from this commit.
+services:
+  - type: web
+    name: svm-8004-indexer
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: SVM8004_CLUSTER
+        value: devnet
+      - key: SVM8004_RPC_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PORT
+        value: 3005

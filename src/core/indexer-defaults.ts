@@ -12,10 +12,15 @@
  * - INDEXER_PRESET: `quantulabs-public` to use upstream public indexers
  * - FORCE_ON_CHAIN: Set to 'true' to bypass the indexer
  *
- * TODO: A Musebook 8004 indexer is not available yet.
- * registry.musebook.trade answers GET /api/health but is a directory UI,
- * not a 8004 REST/GraphQL indexer (no /rest/v1 or /v2/graphql). Use
- * `@musebook/discovery` against musebook.trade for directory search.
+ * The Musebook 8004 indexer lives in this repo as
+ * `@musebook/svm-8004-indexer`. The planned public URL is
+ * https://indexer.musebook.trade (not live yet). Use
+ * `indexerPreset: 'musebook'` or `INDEXER_PRESET=musebook`, and set
+ * `MUSEBOOK_INDEXER_URL` (or INDEXER_URL) to a running instance such as
+ * http://127.0.0.1:3005/rest/v1. GraphQL v2 is a follow-up.
+ *
+ * registry.musebook.trade is still a directory UI, not the 8004 indexer.
+ * Use `@musebook/discovery` against musebook.trade for directory search.
  */
 
 import type { Cluster } from './client.js';
@@ -30,6 +35,17 @@ export const MUSEBOOK_DIRECTORY = {
   registry: 'https://registry.musebook.trade',
   health: 'https://registry.musebook.trade/api/health',
 } as const;
+
+/** Planned public Musebook 8004 indexer (not live yet). */
+export const MUSEBOOK_INDEXER_HOST = 'https://indexer.musebook.trade';
+
+function musebookRestUrl(): string {
+  const override = getEnv('MUSEBOOK_INDEXER_URL');
+  if (override) {
+    return override.replace(/\/$/, '');
+  }
+  return `${MUSEBOOK_INDEXER_HOST}/rest/v1`;
+}
 
 /**
  * Public QuantuLabs 8004 indexers from the upstream 8004-solana SDK.
@@ -90,8 +106,9 @@ function getEnv(key: string): string | undefined {
 export function resolveIndexerPreset(explicit?: IndexerPreset): IndexerPreset {
   if (explicit) return explicit;
   const env = getEnv('INDEXER_PRESET');
-  if (env === 'quantulabs-public') return 'quantulabs-public';
-  if (env === 'none') return 'none';
+  if (env === 'quantulabs-public' || env === 'musebook' || env === 'none') {
+    return env;
+  }
   return DEFAULT_INDEXER_PRESET;
 }
 
@@ -103,8 +120,13 @@ function presetUrls(
   if (cluster === 'localnet') {
     return [...LOCALNET_INDEXERS[kind]];
   }
-  if (resolveIndexerPreset(options?.preset) === 'quantulabs-public') {
+  const preset = resolveIndexerPreset(options?.preset);
+  if (preset === 'quantulabs-public') {
     return [...QUANTULABS_PUBLIC_INDEXERS[cluster][kind]];
+  }
+  if (preset === 'musebook') {
+    // REST first. GraphQL v2 is a follow-up for @musebook/svm-8004-indexer.
+    return kind === 'restUrls' ? [musebookRestUrl()] : [];
   }
   return [];
 }

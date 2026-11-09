@@ -21,12 +21,12 @@ export const DEFAULT_CLUSTER: Cluster = 'devnet';
  * the upstream 8004-solana SDK. These are protocol-compatible with the
  * deployed AgentRegistry8004 programs. They are not Musebook infrastructure.
  *
- * TODO: When a Musebook 8004 REST/GraphQL indexer exists, add a
- * `musebook` preset. registry.musebook.trade is a directory UI
- * (`GET /api/health` is healthy) and does not speak `/rest/v1` or
- * `/v2/graphql`. The human directory lives at musebook.trade; use
- * `@musebook/discovery` for directory search, not the 8004 indexer client.
+ * `musebook`: the Musebook 8004 REST indexer. The planned public URL is
+ * `https://indexer.musebook.trade` (not live yet). Override with
+ * `MUSEBOOK_INDEXER_URL` or `INDEXER_URL`. GraphQL v2 is a follow-up;
+ * this preset advertises REST only. registry.musebook.trade remains a
+ * directory UI, not the 8004 indexer.
  */
-export type IndexerPreset = 'none' | 'quantulabs-public';
+export type IndexerPreset = 'none' | 'quantulabs-public' | 'musebook';
 
 export const DEFAULT_INDEXER_PRESET: IndexerPreset = 'none';

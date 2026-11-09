@@ -33,7 +33,9 @@ export interface SolanaSDKConfig {
     indexerGraphqlUrl?: string;
     /**
      * Select a named indexer preset. Default is `none`.
-     * Use `quantulabs-public` for the upstream QuantuLabs public 8004 indexers.
+     * Use `quantulabs-public` for the upstream QuantuLabs public 8004 indexers,
+     * or `musebook` for the Musebook indexer (configure MUSEBOOK_INDEXER_URL;
+     * https://indexer.musebook.trade is planned and not live yet).
      */
     indexerPreset?: IndexerPreset;
     /**

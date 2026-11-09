@@ -36,7 +36,15 @@ existing 8004 accounts stay compatible.
 - `NOTICE` and a dual copyright line (Musebook + QuantuLabs) on the
   MIT license.
 
+- Workspace package `@musebook/svm-8004-indexer` (`indexer/`): SQLite
+  default, optional Postgres, REST v1 compatible with `IndexerClient`,
+  devnet getProgramAccounts backfill + signature polling. GraphQL v2 is
+  a follow-up. Dockerfile / Railway / Render config are included but not
+  deployed from this drop.
+- `indexerPreset: 'musebook'` (planned `https://indexer.musebook.trade`,
+  not live yet; override with `MUSEBOOK_INDEXER_URL`).
+
 ### Not in this release
 
-- No Musebook 8004 indexer preset yet (see `docs/PROGRAMS.md`).
-- No npm publish and no GitHub repository creation in this drop.
+- GraphQL v2 for the Musebook indexer (REST is implemented).
+- npm publish of either package.

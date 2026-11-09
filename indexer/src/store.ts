@@ -1,0 +1,525 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import Database from 'better-sqlite3';
+import pg from 'pg';
+
+export type Row = Record<string, unknown>;
+
+export interface IndexerStore {
+  kind: 'sqlite' | 'postgres';
+  upsert(table: string, row: Row, conflictKey: string): void | Promise<void>;
+  all(table: string): Row[] | Promise<Row[]>;
+  getCursor(key: string): string | undefined | Promise<string | undefined>;
+  setCursor(key: string, value: string): void | Promise<void>;
+  counts(): { agents: number; feedbacks: number; metadata: number; responses: number; revocations: number } | Promise<{
+    agents: number;
+    feedbacks: number;
+    metadata: number;
+    responses: number;
+    revocations: number;
+  }>;
+  close(): void | Promise<void>;
+}
+
+const TABLES: Record<string, { columns: string[]; conflict: string }> = {
+  agents: {
+    conflict: 'asset',
+    columns: [
+      'agent_id', 'asset', 'owner', 'creator', 'agent_uri', 'agent_wallet', 'collection',
+      'collection_pointer', 'col_locked', 'parent_asset', 'parent_creator', 'parent_locked',
+      'nft_name', 'atom_enabled', 'trust_tier', 'quality_score', 'confidence', 'risk_score',
+      'diversity_ratio', 'feedback_count', 'raw_avg_score', 'sort_key', 'block_slot',
+      'tx_signature', 'created_at', 'updated_at',
+    ],
+  },
+  feedbacks: {
+    conflict: 'id',
+    columns: [
+      'id', 'asset', 'client_address', 'feedback_index', 'value', 'value_decimals', 'score',
+      'tag1', 'tag2', 'endpoint', 'feedback_uri', 'running_digest', 'feedback_hash',
+      'proof_pass_auth', 'is_revoked', 'revoked_at', 'block_slot', 'tx_signature', 'created_at',
+    ],
+  },
+  metadata: {
+    conflict: 'id',
+    columns: [
+      'id', 'asset', 'key', 'key_hash', 'value', 'immutable', 'block_slot', 'tx_signature',
+      'created_at', 'updated_at',
+    ],
+  },
+  feedback_responses: {
+    conflict: 'id',
+    columns: [
+      'id', 'asset', 'client_address', 'feedback_index', 'responder', 'response_uri',
+      'response_hash', 'running_digest', 'response_count', 'block_slot', 'tx_signature', 'created_at',
+    ],
+  },
+  revocations: {
+    conflict: 'id',
+    columns: [
+      'id', 'asset', 'client_address', 'feedback_index', 'feedback_hash', 'slot',
+      'original_score', 'atom_enabled', 'had_impact', 'running_digest', 'revoke_count',
+      'tx_signature', 'created_at',
+    ],
+  },
+  cursors: {
+    conflict: 'key',
+    columns: ['key', 'value'],
+  },
+};
+
+const SQLITE_DDL = `
+CREATE TABLE IF NOT EXISTS agents (
+  agent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset TEXT UNIQUE NOT NULL,
+  owner TEXT NOT NULL,
+  creator TEXT,
+  agent_uri TEXT,
+  agent_wallet TEXT,
+  collection TEXT,
+  collection_pointer TEXT,
+  col_locked INTEGER DEFAULT 0,
+  parent_asset TEXT,
+  parent_creator TEXT,
+  parent_locked INTEGER DEFAULT 0,
+  nft_name TEXT,
+  atom_enabled INTEGER DEFAULT 0,
+  trust_tier INTEGER DEFAULT 0,
+  quality_score INTEGER DEFAULT 0,
+  confidence INTEGER DEFAULT 0,
+  risk_score INTEGER DEFAULT 0,
+  diversity_ratio INTEGER DEFAULT 0,
+  feedback_count INTEGER DEFAULT 0,
+  raw_avg_score REAL DEFAULT 0,
+  sort_key TEXT DEFAULT '0',
+  block_slot INTEGER DEFAULT 0,
+  tx_signature TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedbacks (
+  id TEXT PRIMARY KEY,
+  asset TEXT NOT NULL,
+  client_address TEXT NOT NULL,
+  feedback_index INTEGER NOT NULL,
+  value TEXT,
+  value_decimals INTEGER DEFAULT 0,
+  score INTEGER,
+  tag1 TEXT,
+  tag2 TEXT,
+  endpoint TEXT,
+  feedback_uri TEXT,
+  running_digest TEXT,
+  feedback_hash TEXT,
+  proof_pass_auth INTEGER,
+  is_revoked INTEGER DEFAULT 0,
+  revoked_at TEXT,
+  block_slot INTEGER DEFAULT 0,
+  tx_signature TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS metadata (
+  id TEXT PRIMARY KEY,
+  asset TEXT NOT NULL,
+  key TEXT NOT NULL,
+  key_hash TEXT,
+  value TEXT,
+  immutable INTEGER DEFAULT 0,
+  block_slot INTEGER DEFAULT 0,
+  tx_signature TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedback_responses (
+  id TEXT PRIMARY KEY,
+  asset TEXT NOT NULL,
+  client_address TEXT,
+  feedback_index INTEGER,
+  responder TEXT,
+  response_uri TEXT,
+  response_hash TEXT,
+  running_digest TEXT,
+  response_count INTEGER,
+  block_slot INTEGER DEFAULT 0,
+  tx_signature TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS revocations (
+  id TEXT PRIMARY KEY,
+  asset TEXT NOT NULL,
+  client_address TEXT,
+  feedback_index INTEGER,
+  feedback_hash TEXT,
+  slot INTEGER,
+  original_score INTEGER,
+  atom_enabled INTEGER,
+  had_impact INTEGER,
+  running_digest TEXT,
+  revoke_count INTEGER,
+  tx_signature TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cursors (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`;
+
+const POSTGRES_DDL = SQLITE_DDL
+  .replace(/INTEGER PRIMARY KEY AUTOINCREMENT/g, 'BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY')
+  .replace(/INTEGER /g, 'BIGINT ');
+
+function jsonSafe(row: Row): Row {
+  const out: Row = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (typeof value === 'boolean') out[key] = value;
+    else if (value === null || value === undefined) out[key] = null;
+    else if (typeof value === 'bigint') out[key] = Number(value);
+    else out[key] = value;
+  }
+  return out;
+}
+
+function boolToInt(value: unknown): unknown {
+  if (typeof value === 'boolean') return value ? 1 : 0;
+  return value;
+}
+
+export class SqliteStore implements IndexerStore {
+  kind = 'sqlite' as const;
+  private db: Database.Database;
+
+  constructor(databaseUrl: string) {
+    const file = databaseUrl.replace(/^sqlite:/, '');
+    if (file !== ':memory:') {
+      const dir = path.dirname(path.resolve(file));
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    this.db = new Database(file);
+    this.db.pragma('journal_mode = WAL');
+    this.db.exec(SQLITE_DDL);
+  }
+
+  upsert(table: string, row: Row, conflictKey = TABLES[table]?.conflict ?? 'id'): void {
+    const spec = TABLES[table];
+    if (!spec) throw new Error(`Unknown table ${table}`);
+    const existing = conflictKey === 'asset' || conflictKey === 'id' || conflictKey === 'key'
+      ? this.db.prepare(`SELECT * FROM ${table} WHERE ${conflictKey} = ?`).get(row[conflictKey]) as Row | undefined
+      : undefined;
+    const merged: Row = { ...(existing ?? {}), ...row };
+    if (table === 'agents') {
+      if (!existing) {
+        delete merged.agent_id;
+        if (!merged.created_at) merged.created_at = merged.updated_at ?? new Date().toISOString();
+      } else if (existing.agent_id !== undefined) {
+        merged.agent_id = existing.agent_id;
+        merged.created_at = existing.created_at ?? merged.created_at;
+      }
+    }
+    const cols = spec.columns.filter((col) => col === 'agent_id' ? merged.agent_id !== undefined : true);
+    const present = cols.filter((col) => merged[col] !== undefined);
+    const placeholders = present.map(() => '?').join(', ');
+    const updates = present.filter((col) => col !== conflictKey && col !== 'agent_id').map((col) => `${col} = excluded.${col}`).join(', ');
+    const sql = `INSERT INTO ${table} (${present.join(', ')}) VALUES (${placeholders})
+      ON CONFLICT(${conflictKey}) DO UPDATE SET ${updates || `${conflictKey} = excluded.${conflictKey}`}`;
+    this.db.prepare(sql).run(...present.map((col) => boolToInt(merged[col])));
+  }
+
+  all(table: string): Row[] {
+    if (table === 'agent_reputation' || table === 'leaderboard') {
+      return this.derivedAgents(table === 'leaderboard');
+    }
+    if (table === 'collection_stats') return this.collectionStats();
+    if (table === 'global_stats') return [this.globalStats()];
+    if (table === 'collections' || table === 'collection_pointers') return this.collections();
+    if (table === 'collection_assets') return this.all('agents');
+    if (table === 'collection_asset_count') return this.collectionAssetCounts();
+    if (!TABLES[table] && table !== 'agent_reputation') return [];
+    return this.db.prepare(`SELECT * FROM ${table}`).all().map((row) => this.normalize(table, row as Row));
+  }
+
+  getCursor(key: string): string | undefined {
+    const row = this.db.prepare('SELECT value FROM cursors WHERE key = ?').get(key) as { value: string } | undefined;
+    return row?.value;
+  }
+
+  setCursor(key: string, value: string): void {
+    this.db.prepare('INSERT INTO cursors(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
+  }
+
+  counts() {
+    const count = (table: string) => (this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+    return {
+      agents: count('agents'),
+      feedbacks: count('feedbacks'),
+      metadata: count('metadata'),
+      responses: count('feedback_responses'),
+      revocations: count('revocations'),
+    };
+  }
+
+  close(): void {
+    this.db.close();
+  }
+
+  private normalize(table: string, row: Row): Row {
+    const out = jsonSafe(row);
+    const boolFields = ['col_locked', 'parent_locked', 'atom_enabled', 'is_revoked', 'proof_pass_auth', 'immutable', 'had_impact'];
+    for (const field of boolFields) {
+      if (field in out && out[field] !== null && out[field] !== undefined) {
+        out[field] = Boolean(out[field]);
+      }
+    }
+    if (table === 'agents' && typeof out.collection_pointer !== 'string' && typeof out.collection === 'string') {
+      // leave as-is
+    }
+    return out;
+  }
+
+  private derivedAgents(forLeaderboard: boolean): Row[] {
+    const agents = this.all('agents');
+    const feedbacks = this.all('feedbacks');
+    const byAsset = new Map<string, Row[]>();
+    for (const fb of feedbacks) {
+      const asset = String(fb.asset);
+      if (!byAsset.has(asset)) byAsset.set(asset, []);
+      byAsset.get(asset)!.push(fb);
+    }
+    const rows: Row[] = agents.map((agent) => {
+      const list = byAsset.get(String(agent.asset)) ?? [];
+      const active = list.filter((fb) => !fb.is_revoked);
+      const scores = active.map((fb) => Number(fb.score ?? 0));
+      const avg = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
+      return {
+        ...agent,
+        feedback_count: agent.feedback_count ?? list.length,
+        avg_score: avg,
+        positive_count: scores.filter((s) => s >= 50).length,
+        negative_count: scores.filter((s) => s < 50).length,
+        validation_count: 0,
+      };
+    });
+    if (forLeaderboard) {
+      return [...rows].sort((a, b) => String(b.sort_key ?? '').localeCompare(String(a.sort_key ?? ''), undefined, { numeric: true }));
+    }
+    return rows;
+  }
+
+  private collections(): Row[] {
+    const agents = this.all('agents');
+    const map = new Map<string, Row>();
+    for (const agent of agents) {
+      const pointer = String(agent.collection_pointer ?? agent.col ?? '');
+      const collection = String(agent.collection ?? '');
+      const creator = String(agent.creator ?? '');
+      const key = `${pointer}|${collection}|${creator}`;
+      if (!map.has(key)) {
+        map.set(key, {
+          collection_id: map.size + 1,
+          collection: pointer || collection,
+          col: pointer || collection,
+          creator,
+          first_seen_asset: agent.asset,
+          agent_count: 0,
+        });
+      }
+      const row = map.get(key)!;
+      row.agent_count = Number(row.agent_count) + 1;
+    }
+    return [...map.values()];
+  }
+
+  private collectionStats(): Row[] {
+    const agents = this.all('agents');
+    const byCol = new Map<string, Row[]>();
+    for (const agent of agents) {
+      const key = String(agent.collection_pointer ?? agent.collection ?? '');
+      if (!byCol.has(key)) byCol.set(key, []);
+      byCol.get(key)!.push(agent);
+    }
+    return [...byCol.entries()].map(([collection, list]) => ({
+      collection,
+      agent_count: list.length,
+      feedback_count: list.reduce((n, a) => n + Number(a.feedback_count ?? 0), 0),
+      avg_quality: list.length
+        ? list.reduce((n, a) => n + Number(a.quality_score ?? 0), 0) / list.length
+        : null,
+    }));
+  }
+
+  private collectionAssetCounts(): Row[] {
+    return this.collectionStats().map((row) => ({
+      collection: row.collection,
+      col: row.collection,
+      creator: null,
+      asset_count: row.agent_count,
+    }));
+  }
+
+  private globalStats(): Row {
+    const agents = this.all('agents');
+    const feedbacks = this.all('feedbacks');
+    const collections = new Set(agents.map((a) => String(a.collection_pointer ?? a.collection ?? '')));
+    return {
+      total_agents: agents.length,
+      total_collections: collections.size,
+      total_feedbacks: feedbacks.length,
+      platinum_agents: agents.filter((a) => Number(a.trust_tier) === 4).length,
+      gold_agents: agents.filter((a) => Number(a.trust_tier) === 3).length,
+      avg_quality: agents.length
+        ? agents.reduce((n, a) => n + Number(a.quality_score ?? 0), 0) / agents.length
+        : null,
+    };
+  }
+}
+
+export class PostgresStore implements IndexerStore {
+  kind = 'postgres' as const;
+  private pool: pg.Pool;
+  private ready: Promise<void>;
+
+  constructor(databaseUrl: string) {
+    this.pool = new pg.Pool({ connectionString: databaseUrl, max: 4 });
+    this.ready = this.pool.query(POSTGRES_DDL).then(() => undefined);
+  }
+
+  private async ensure() {
+    await this.ready;
+  }
+
+  async upsert(table: string, row: Row, conflictKey = TABLES[table]?.conflict ?? 'id'): Promise<void> {
+    await this.ensure();
+    const spec = TABLES[table];
+    if (!spec) throw new Error(`Unknown table ${table}`);
+    const existingRes = await this.pool.query(`SELECT * FROM ${table} WHERE ${conflictKey} = $1`, [row[conflictKey]]);
+    const existing = existingRes.rows[0] as Row | undefined;
+    const merged: Row = { ...(existing ?? {}), ...row };
+    if (table === 'agents') {
+      if (!existing) {
+        delete merged.agent_id;
+        if (!merged.created_at) merged.created_at = merged.updated_at ?? new Date().toISOString();
+      } else {
+        merged.agent_id = existing.agent_id;
+        merged.created_at = existing.created_at ?? merged.created_at;
+      }
+    }
+    const present = spec.columns.filter((col) => merged[col] !== undefined && (col !== 'agent_id' || merged.agent_id !== undefined));
+    const placeholders = present.map((_, i) => `$${i + 1}`).join(', ');
+    const updates = present.filter((col) => col !== conflictKey && col !== 'agent_id').map((col) => `${col} = EXCLUDED.${col}`).join(', ');
+    const sql = `INSERT INTO ${table} (${present.join(', ')}) VALUES (${placeholders})
+      ON CONFLICT (${conflictKey}) DO UPDATE SET ${updates || `${conflictKey} = EXCLUDED.${conflictKey}`}`;
+    await this.pool.query(sql, present.map((col) => boolToInt(merged[col])));
+  }
+
+  async all(table: string): Promise<Row[]> {
+    await this.ensure();
+    const sqlite = new InMemoryDerived(this);
+    return sqlite.all(table);
+  }
+
+  async getCursor(key: string): Promise<string | undefined> {
+    await this.ensure();
+    const res = await this.pool.query('SELECT value FROM cursors WHERE key = $1', [key]);
+    return res.rows[0]?.value;
+  }
+
+  async setCursor(key: string, value: string): Promise<void> {
+    await this.ensure();
+    await this.pool.query(
+      'INSERT INTO cursors(key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+      [key, value],
+    );
+  }
+
+  async counts() {
+    await this.ensure();
+    const count = async (table: string) => Number((await this.pool.query(`SELECT COUNT(*) AS n FROM ${table}`)).rows[0].n);
+    return {
+      agents: await count('agents'),
+      feedbacks: await count('feedbacks'),
+      metadata: await count('metadata'),
+      responses: await count('feedback_responses'),
+      revocations: await count('revocations'),
+    };
+  }
+
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
+
+  async rawAll(table: string): Promise<Row[]> {
+    await this.ensure();
+    const res = await this.pool.query(`SELECT * FROM ${table}`);
+    return res.rows.map((row) => normalizePg(table, row));
+  }
+}
+
+function normalizePg(table: string, row: Row): Row {
+  const out = jsonSafe(row);
+  const boolFields = ['col_locked', 'parent_locked', 'atom_enabled', 'is_revoked', 'proof_pass_auth', 'immutable', 'had_impact'];
+  for (const field of boolFields) {
+    if (field in out && out[field] !== null && out[field] !== undefined) {
+      out[field] = Boolean(out[field]);
+    }
+  }
+  void table;
+  return out;
+}
+
+/** Compute derived views for Postgres using the same logic as SQLite. */
+class InMemoryDerived {
+  constructor(private store: PostgresStore) {}
+  async all(table: string): Promise<Row[]> {
+    if (table === 'agent_reputation' || table === 'leaderboard') {
+      const agents = await this.store.rawAll('agents');
+      const feedbacks = await this.store.rawAll('feedbacks');
+      const byAsset = new Map<string, Row[]>();
+      for (const fb of feedbacks) {
+        const asset = String(fb.asset);
+        if (!byAsset.has(asset)) byAsset.set(asset, []);
+        byAsset.get(asset)!.push(fb);
+      }
+      const rows: Row[] = agents.map((agent) => {
+        const list = byAsset.get(String(agent.asset)) ?? [];
+        const active = list.filter((fb) => !fb.is_revoked);
+        const scores = active.map((fb) => Number(fb.score ?? 0));
+        const avg = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
+        return {
+          ...agent,
+          feedback_count: agent.feedback_count ?? list.length,
+          avg_score: avg,
+          positive_count: scores.filter((s) => s >= 50).length,
+          negative_count: scores.filter((s) => s < 50).length,
+          validation_count: 0,
+        };
+      });
+      if (table === 'leaderboard') {
+        return [...rows].sort((a, b) => String(b.sort_key ?? '').localeCompare(String(a.sort_key ?? ''), undefined, { numeric: true }));
+      }
+      return rows;
+    }
+    if (table === 'collection_stats' || table === 'collection_asset_count' || table === 'collections' || table === 'collection_pointers' || table === 'global_stats' || table === 'collection_assets') {
+      // Reuse a throwaway sqlite-in-memory? Simpler to duplicate small bits via a temp SqliteStore? 
+      // Load agents into a helper.
+      const helper = new SqliteStore('sqlite::memory:');
+      for (const agent of await this.store.rawAll('agents')) helper.upsert('agents', agent, 'asset');
+      for (const fb of await this.store.rawAll('feedbacks')) helper.upsert('feedbacks', fb, 'id');
+      const rows = helper.all(table);
+      helper.close();
+      return rows;
+    }
+    return this.store.rawAll(table);
+  }
+}
+
+export async function openStore(databaseUrl: string): Promise<IndexerStore> {
+  const url = databaseUrl.trim();
+  if (url.startsWith('postgres://') || url.startsWith('postgresql://')) {
+    return new PostgresStore(url);
+  }
+  return new SqliteStore(url.startsWith('sqlite:') ? url : `sqlite:${url}`);
+}
+
+export async function listTable(store: IndexerStore, table: string): Promise<Row[]> {
+  return await store.all(table);
+}

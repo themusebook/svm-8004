@@ -268,6 +268,7 @@ export {
 export {
   QUANTULABS_PUBLIC_INDEXERS,
   MUSEBOOK_DIRECTORY,
+  MUSEBOOK_INDEXER_HOST,
   resolveIndexerPreset,
 } from './core/indexer-defaults.js';
 
